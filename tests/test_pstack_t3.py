@@ -283,6 +283,16 @@ class InstallTest(unittest.TestCase):
             (home / ".grok/skills").symlink_to(ROOT / "skills/swarm")
             self.assertNotEqual(self.run_install(home, "doctor", "--harness", "grok").returncode, 0)
 
+    def test_doctor_flags_stale_copies_in_directories_a_provider_also_reads(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            self.assertEqual(self.run_install(home, "--harness", "codex").returncode, 0)
+            (home / ".codex/skills/swarm").mkdir(parents=True)
+            (home / ".codex/skills/swarm/SKILL.md").write_text("old")
+            result = self.run_install(home, "doctor", "--harness", "codex")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(".codex/skills also holds other copies", result.stdout)
+
     def test_shared_real_directory_is_linked_once(self):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)

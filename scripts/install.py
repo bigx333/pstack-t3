@@ -32,6 +32,19 @@ def skill_dirs(scope_root, user):
     }
 
 
+def extra_dirs(scope_root, user):
+    """Other directories each provider also reads skills from, where stale copies can compete."""
+    home = Path(os.environ.get("HOME", str(Path.home())))
+    base = home if user else scope_root
+    claude = skill_dirs(scope_root, user)["claude"]
+    return {
+        "claude": [],
+        "codex": [base / ".codex" / "skills"],
+        "grok": [],
+        "cursor": [base / ".agents" / "skills", base / ".codex" / "skills", claude],
+    }
+
+
 def state_dir(scope_root, user):
     if user:
         config = Path(os.environ.get("XDG_CONFIG_HOME") or Path(os.environ.get("HOME", str(Path.home()))) / ".config")
@@ -224,6 +237,12 @@ def doctor(args):
         print(f"{harness:7} {directory}: {len(installed)}/{len(names)} pstack-t3" +
               (f", {len(foreign)} taken by other copies ({', '.join(foreign[:5])}{'...' if len(foreign) > 5 else ''})" if foreign else "") +
               (f", {len(missing)} missing" if missing else ""))
+        for extra in extra_dirs(scope, user)[harness]:
+            stale = [n for n in names if (extra / n).exists() and not ours(extra / n)]
+            if stale:
+                healthy = False
+                print(f"        {extra} also holds other copies of {len(stale)} of these "
+                      f"({', '.join(stale[:5])}{'...' if len(stale) > 5 else ''}); {harness} may load those instead")
         if not user:
             # Claude and Grok load the user copy when both scopes define a name.
             user_directory = skill_dirs(None, True)[harness]
