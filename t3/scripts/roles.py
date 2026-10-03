@@ -141,7 +141,7 @@ def merged_config(cwd, user_path=None, project_path=None):
         for name, seats in config.get("roles", {}).items():
             roles[name] = seats
             sources[name] = str(origin)
-    budget = project.get("budget") or user.get("budget") or "default"
+    budget = project["budget"] if "budget" in project else user.get("budget", "default")
     return {"budget": budget, "roles": roles, "sources": sources}
 
 
@@ -220,20 +220,23 @@ def default_seats(name, catalog):
         return [INHERIT]
     parent = catalog.get("inheritedProviderInstanceId")
     parent_model = catalog.get("inheritedModel")
+    parent_runs = runnable(providers_by_id(catalog).get(parent)) if parent else False
     seats, families = [], set()
-    if parent and parent_model:
+    if parent_runs and parent_model:
         seats.append(INHERIT)
         families.add(family(parent_model))
     for provider in catalog["providers"]:
-        if not runnable(provider) or provider["providerInstanceId"] == parent:
+        if not runnable(provider) or (parent_runs and provider["providerInstanceId"] == parent):
             continue
         model = models_of(provider)[0]["id"]
         if family(model) in families:
             continue
         families.add(family(model))
         seats.append({"providerInstanceId": provider["providerInstanceId"], "model": model})
-    if len(seats) <= 1:
-        return [INHERIT, INHERIT, INHERIT]
+    if len(seats) == 1:
+        return seats * 3
+    if not seats:
+        raise RolesError("no provider in the catalog can run child tasks")
     return seats
 
 
@@ -243,7 +246,8 @@ def inherit_with_budget(catalog, budget):
     parent_model = catalog.get("inheritedModel")
     if BUDGETS[budget] is None or not parent or not parent_model:
         return INHERIT, None
-    model = find_model(providers_by_id(catalog).get(parent), parent_model)
+    provider = providers_by_id(catalog).get(parent)
+    model = find_model(provider, parent_model) if runnable(provider) else None
     if model is None or effort_option(model) is None:
         return INHERIT, None
     seat = apply_budget({"providerInstanceId": parent, "model": parent_model}, model, budget)
@@ -268,7 +272,7 @@ def resolve_seat(seat, catalog, budget):
         note = f"{seat['providerInstanceId']}/{seat['model']} is not in the catalog; using {model['id']}"
         notes.append(note)
         problems.append(note)
-        seat = {"providerInstanceId": provider["providerInstanceId"], "model": model["id"]}
+        seat = {**seat, "providerInstanceId": provider["providerInstanceId"], "model": model["id"]}
     known = {option["id"] for option in options_of(model)}
     dropped = sorted(set(seat.get("options") or {}) - known)
     if dropped:
@@ -365,8 +369,14 @@ def command_write(args):
         if not equals or name not in ROLES:
             raise RolesError(f"--set {assignment!r}: expected '<role>=<seat>[;<seat>...]' with a known role")
         roles[name] = [parse_seat(part) for part in value.split(";") if part.strip()]
-    config = check_shape({"version": 1, "budget": args.budget or existing.get("budget", "default"), "roles": roles}, target)
-    problems = validate({"budget": config["budget"], "roles": roles, "sources": {}}, catalog)
+    config = {"version": 1, "roles": roles}
+    budget = args.budget or existing.get("budget")
+    if budget is not None:
+        config["budget"] = budget
+    elif not args.project:
+        config["budget"] = "default"
+    check_shape(config, target)
+    problems = validate({"budget": config.get("budget", "default"), "roles": roles, "sources": {}}, catalog)
     if problems and not args.force:
         raise RolesError("refusing to write; these seats do not match the catalog:\n" + "\n".join(problems))
     write_atomic(target, config)

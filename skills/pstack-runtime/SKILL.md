@@ -53,7 +53,7 @@ Tool names may carry a harness prefix, such as `mcp__t3-code__delegate_task` or 
 4. A child starts with only its brief. It sees none of this conversation. Put the goal, the exact paths or SHAs, how to verify, and the report shape in the brief. Point at files instead of pasting large context. Write tool steps as plain verbs ("read", "search the repo", "run"), because the child may be a different provider with different tool names.
 5. Collect results.
    - If nothing else in this turn depends on the results, end the turn. Each completion wakes this thread.
-   - If you need a result now, call `task_status` with the `taskId`. `workState: "result_available"` means done, and `summary` holds the result. `working` and `waiting_for_children` mean not done. Do not busy-poll. Do other work between checks.
+   - If you need a result now, call `task_status` with the `taskId`. Reading a terminal result this way acknowledges it, so no completion notification follows. Process that result immediately, as if the notification had arrived. `workState: "result_available"` means done, and `summary` holds the result. `working` and `waiting_for_children` mean not done. Do not busy-poll. Do other work between checks.
    - `mode: "wait"` blocks for at most `timeoutMs`, ten minutes by default. Use it only for short children whose result gates the very next step. `waitTimedOut: true` does not cancel the child. Keep the `taskId`.
 6. You own every child's output. Read the diff or the evidence yourself before you report it. A child's "done" is a claim, not a verification.
 
@@ -128,7 +128,7 @@ Agreement between seats on the same model is weak evidence. It shows the prompt 
 
 ### Budget
 
-The config may carry `"budget"`: `default`, `small`, `medium`, `large`, or `unlimited`. It caps the reasoning option of every seat that has one (`effort`, `reasoningEffort`, or `reasoning`) at `medium`, `high`, `xhigh`, or the highest non-special value. `default` leaves options alone. `ultracode` and `ultrathink` are never chosen by a budget. A lower explicit choice is kept. Under any budget other than `default`, an `inherit` seat becomes an explicit target on this thread's provider and model with the capped option, because an omitted `target` would pass the parent's reasoning level through. `roles.py show` reports the budgeted seats.
+The config may carry `"budget"`: `default`, `small`, `medium`, `large`, or `unlimited`. It sets the reasoning option of every seat that has one (`effort`, `reasoningEffort`, `reasoning_effort`, or `reasoning`) to `medium`, `high`, `xhigh`, or the highest non-special value, or the closest lower value the model offers. A seat that names its own reasoning level keeps it when it is at or below the budget level, and is lowered to the budget level otherwise. `default` leaves options alone. `ultracode` and `ultrathink` are never chosen by a budget. Under any budget other than `default`, an `inherit` seat becomes an explicit target on this thread's provider and model with the budgeted option, because an omitted `target` would pass the parent's reasoning level through. `roles.py show` reports the budgeted seats.
 
 ### Fallback
 
@@ -145,7 +145,8 @@ When a seat's provider is not runnable or its model is not in the catalog:
 Two writers never share a checkout (principle-separate-before-serializing-shared-state).
 
 - Read-only children share the current checkout.
-- A writing child that may overlap with another writer gets its own git worktree. Name it in the brief: "Create a worktree with `git worktree add ../<repo>-<slug> -b <branch> <base>` and work only there. Report the path, branch, and head SHA." The parent removes the worktree after integrating it.
+- A writing child that may overlap with another writer gets its own git worktree, which the parent creates before delegating: `git worktree add <path> -b <branch> <base>`. `delegate_task` has no workspace argument, so the child's thread stays bound to this checkout and its default working directory is still here. The brief must say: "Work only in `<absolute worktree path>`. Use absolute paths under it for every read and edit, and prefix every command with `cd <absolute worktree path> &&`. Report the branch and head SHA." Check the child's diff landed in the worktree and not in this checkout before integrating. The parent removes the worktree afterwards.
+- When a writer's isolation must not depend on the brief being obeyed, or the work is a long-lived independent unit, launch a top-level thread with a worktree strategy instead, where [Top-level threads](#top-level-threads) allows it.
 - Long-lived owners that should appear in T3's sidebar with their own binding (PR owners in Autopilot and Orchestrate) are top-level threads launched with a worktree strategy. See below.
 - Uncommitted changes are not copied into new worktrees. Commit or stash first, or point the brief at a pushed branch.
 
@@ -164,6 +165,7 @@ Create top-level threads only when the user asked for separate threads or invoke
 
 - For a stack, `baseRef` is the parent branch and `startFromOrigin` is false.
 - Omitted `workspaceStrategy` means the project root, not your worktree.
+- `t3_thread_launch` requires a full-access or default caller. In `approval-required` or `auto-accept-edits` it fails. Then fall back to child tasks isolated per [Isolation](#isolation), and tell the user that owners are children rather than threads.
 - `t3_thread_launch` has no retry key. Retain the `threadId`. After an error or lost response, check `t3_thread_list` before retrying.
 - Follow a thread with `t3_thread_wait` and read it with `t3_thread_read` (use `afterPosition` to read only what is new). Send follow-ups with `t3_thread_send`, interrupt with `t3_thread_interrupt`.
 - `create_threads` makes up to 20 threads sharing this checkout. Use it only for read-only fan-out the user wants visible as threads.
@@ -193,7 +195,7 @@ After a T3 restart, assume a child is gone unless `task_status` shows `working` 
 
 ## Verification surfaces
 
-- Web or Electron UI: `preview_open` the dev server URL, then `preview_snapshot`, `preview_click`, `preview_type`, `preview_press`, `preview_wait_for`, `preview_evaluate`. Record proof with `preview_recording_start` and `preview_recording_stop`. Check `preview_status` first and close previews you opened with `t3_preview_close`.
+- Web or Electron UI: `preview_open` the dev server URL, then `preview_snapshot`, `preview_click`, `preview_type`, `preview_press`, `preview_wait_for`, `preview_evaluate`. Record proof with `preview_recording_start` and `preview_recording_stop`. Check `preview_status` first. Keep the `tabId` that `preview_open` returns and close each preview you opened with `t3_preview_close` and that `tabId`.
 - Devices and simulators: `device_list`, `device_open`, `device_screenshot`, `device_close`.
 - CLIs and TUIs: run them in the terminal and assert on output.
 - A project `verify-*` skill beats all of these when one exists.
@@ -212,7 +214,9 @@ After you open a PR or start driving an existing one, call `link_pull_request` w
 
 ## Pending requests
 
-A child or launched thread can stall on an approval or input request. `t3_pending_request_list` shows them and `t3_pending_request_read` shows one. Answer with `t3_pending_request_respond` only within the permissions the user already granted. Never approve a destructive action on a child's behalf.
+A child or launched thread can stall on a question for the user. `t3_pending_request_list` shows those and `t3_pending_request_read` shows one. Answer with `t3_pending_request_respond` only from facts and decisions the user already gave.
+
+Approval (permission) requests are not listed and cannot be answered by these tools. A child stalled on one looks idle in `task_status`. Avoid the stall: children inherit this thread's runtime mode, so a child that must run commands or edit needs a parent in a mode that allows it. If a child stalls anyway, tell the user which thread is waiting for approval. Never raise a child's `runtimeMode` to get around it.
 
 ## ACP fallback
 

@@ -115,6 +115,17 @@ class RolesTest(unittest.TestCase):
         resolved = roles.resolve(config("small", **{"bug-fix": [seat]}), CATALOG, ["bug-fix"])["roles"]["bug-fix"]["seats"][0]
         self.assertEqual(resolved["options"], {"thinking": True})
 
+    def test_model_fallback_keeps_options_the_fallback_model_supports(self):
+        seat = {"providerInstanceId": "codex", "model": "gone", "options": {"reasoningEffort": "low", "serviceTier": "priority"}}
+        entry = roles.resolve(config("large", **{"bug-fix": [seat]}), CATALOG, ["bug-fix"])["roles"]["bug-fix"]
+        self.assertEqual(entry["seats"][0]["options"], {"reasoningEffort": "low", "serviceTier": "priority"})
+
+    def test_panel_when_parent_provider_cannot_run_children(self):
+        catalog = {**CATALOG, "inheritedProviderInstanceId": "cursor", "inheritedModel": "grok-4.7",
+                   "providers": [p for p in CATALOG["providers"] if p["providerInstanceId"] in ("cursor", "grok")]}
+        seats = roles.resolve(config(), catalog, ["verifiers"])["roles"]["verifiers"]["seats"]
+        self.assertEqual(seats, [{"providerInstanceId": "grok", "model": "grok-4.7"}] * 3)
+
     def test_parse_seat(self):
         self.assertEqual(roles.parse_seat("inherit"), "inherit")
         self.assertEqual(roles.parse_seat("codex/gpt-6.1-sol?reasoningEffort=high&fast=true"),
@@ -135,6 +146,18 @@ class RolesTest(unittest.TestCase):
         self.assertEqual(merged["budget"], "small")
         self.assertEqual(merged["roles"]["bug-fix"][0]["providerInstanceId"], "grok")
         self.assertEqual(merged["roles"]["hillclimb"], ["inherit"])
+
+    def test_project_write_without_budget_keeps_the_user_budget(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            (base / ".git").mkdir()
+            user = base / "user.json"
+            user.write_text(json.dumps({"budget": "large", "roles": {}}))
+            catalog = str(ROOT / "tests/fixtures/catalog.json")
+            self.assertEqual(roles.main(["write", "--project", "--cwd", directory, "--catalog", catalog, "--set", "bug-fix=inherit"]), 0)
+            project = base / ".pstack/t3-roles.json"
+            self.assertNotIn("budget", json.loads(project.read_text()))
+            self.assertEqual(roles.merged_config(base, user, project)["budget"], "large")
 
     def test_write_refuses_seats_outside_the_catalog_and_is_idempotent(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -225,6 +248,18 @@ class InstallTest(unittest.TestCase):
             backups = sorted(p.read_text() for p in (home / ".config/pstack-t3/backups").rglob("swarm"))
             self.assertEqual(backups, ["first", "second"])
 
+    def test_replace_never_moves_the_checkout_when_a_skills_dir_points_into_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            (home / ".grok").mkdir()
+            (home / ".grok/skills").symlink_to(ROOT / "skills")
+            result = self.run_install(home, "--harness", "grok", "--replace")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue((ROOT / "skills/swarm/SKILL.md").is_file())
+            self.assertFalse((ROOT / "skills/swarm").is_symlink())
+            self.assertEqual(self.run_install(home, "uninstall").returncode, 0)
+            self.assertTrue((ROOT / "skills/swarm/SKILL.md").is_file())
+
     def test_shared_real_directory_is_linked_once(self):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
@@ -249,6 +284,26 @@ class BuildTest(unittest.TestCase):
             self.assertTrue((out / "pstack-runtime/scripts/roles.py").exists())
             for skill_md in out.glob("*/SKILL.md"):
                 self.assertNotIn("disable-model-invocation", skill_md.read_text().split("---")[1], skill_md)
+
+    def test_replace_tree_recovers_an_interrupted_swap_before_copying(self):
+        import build
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            (base / "dest.outgoing").mkdir()
+            (base / "dest.outgoing/old").write_text("old")
+            (base / "src").mkdir()
+            with mock.patch.object(build.shutil, "copytree", side_effect=OSError("disk full")):
+                with self.assertRaises(OSError):
+                    build.replace_tree(base / "src", base / "dest")
+            self.assertEqual((base / "dest/old").read_text(), "old")
+
+    def test_check_rejects_invalid_yaml_frontmatter(self):
+        with tempfile.TemporaryDirectory() as directory:
+            skill = Path(directory) / "demo"
+            skill.mkdir()
+            (skill / "SKILL.md").write_text("---\nname: demo\ndescription: [unterminated\n---\n\nbody\n")
+            self.assertTrue(any("not valid YAML" in finding for finding in check.check_tree(directory)))
 
     def test_check_flags_cursor_leftovers(self):
         with tempfile.TemporaryDirectory() as directory:

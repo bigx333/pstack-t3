@@ -40,7 +40,18 @@ def state_dir(scope_root, user):
 
 
 def ours(path):
-    return path.is_symlink() and Path(os.readlink(path)).resolve().parent == SKILLS.resolve()
+    """A link whose target is a skill directory in this checkout. Never follows loops."""
+    if not path.is_symlink():
+        return False
+    target = Path(os.path.normpath(os.path.join(path.parent, os.readlink(path))))
+    return target.parent in (SKILLS, Path(os.path.realpath(SKILLS)))
+
+
+def inside_checkout(path):
+    """True when the path is, or resolves into, this checkout's skills tree."""
+    real = Path(os.path.realpath(path))
+    skills = Path(os.path.realpath(SKILLS))
+    return real == skills or skills in real.parents
 
 
 def describe(path):
@@ -66,13 +77,19 @@ def plan(targets, names):
     """Return (actions, conflicts). Directories sharing a real path are visited once."""
     actions, conflicts, seen = [], [], set()
     for harness, directory in targets.items():
-        real = directory.resolve()
+        real = Path(os.path.realpath(directory))
         if real in seen:
             continue
         seen.add(real)
+        if inside_checkout(directory):
+            print(f"{harness}: {directory} already resolves to {SKILLS}; nothing to link")
+            continue
         for name in names:
             link = directory / name
             if ours(link):
+                continue
+            if inside_checkout(link):
+                # Moving this aside would move pstack-t3's own skill directory.
                 continue
             if link.exists() or link.is_symlink():
                 conflicts.append((harness, link))
@@ -174,6 +191,9 @@ def doctor(args):
     healthy = True
     for harness, directory in skill_dirs(scope, user).items():
         if harness not in args.harness:
+            continue
+        if inside_checkout(directory):
+            print(f"{harness:7} {directory}: resolves to the pstack-t3 skills tree itself")
             continue
         installed = [n for n in names if ours(directory / n)]
         foreign = [n for n in names if (directory / n).exists() and not ours(directory / n)]

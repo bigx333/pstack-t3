@@ -143,6 +143,9 @@ def replace_tree(source, destination):
     """Swap destination for a full copy of source, keeping the old tree until the copy exists."""
     incoming = destination.with_name(destination.name + ".incoming")
     outgoing = destination.with_name(destination.name + ".outgoing")
+    if outgoing.exists() and not destination.exists():
+        # A previous swap died between renames; its old tree is the only good copy.
+        outgoing.rename(destination)
     for leftover in (incoming, outgoing):
         if leftover.exists():
             shutil.rmtree(leftover)
