@@ -42,7 +42,10 @@ $interrogate review the last commit, "Fix median for even-length input".
 ```
 
 > **Reviewers.** Resolved `interrogate reviewers` with `roles.py`. Launched all four through `delegate_task` with identical read-only briefs.
-> A: Codex / gpt-6.1-sol. B: Claude / claude-opus-5-5. C: Cursor / Auto. D: Grok / grok-4.7.
+> - A: Codex / gpt-6.1-sol
+> - B: Claude / claude-opus-5-5
+> - C: Cursor / Auto
+> - D: Grok / grok-4.7
 >
 > **Act on.**
 > 1. Incorrect even-length median (A, B, C, D). `stats.py:5` uses `// 2`, flooring the average. `[1, 2]` returns `1` instead of `1.5`.
