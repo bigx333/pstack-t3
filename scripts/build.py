@@ -136,6 +136,10 @@ def build(destination, update_lock=False, skip_lock=False):
         if findings:
             raise SystemExit("check failed:\n  " + "\n  ".join(findings))
         replace_tree(staged, destination)
+    if destination == ROOT / "skills":
+        from catalog import write
+
+        write(destination)
     return destination
 
 

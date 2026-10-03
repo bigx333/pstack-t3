@@ -338,6 +338,13 @@ class BuildTest(unittest.TestCase):
             (skill / "SKILL.md").write_text("---\nname: demo\ndescription: [unterminated\n---\n\nbody\n")
             self.assertTrue(any("not valid YAML" in finding for finding in check.check_tree(directory)))
 
+    def test_catalog_lists_every_skill_and_playbook(self):
+        import catalog
+        text = catalog.render(ROOT / "skills")
+        for skill_md in (ROOT / "skills").glob("*/SKILL.md"):
+            self.assertIn(f"[`{skill_md.parent.name}`]", text)
+        self.assertIn("(../skills/poteto-mode/playbooks/bug-fix.md)", text)
+
     def test_check_flags_cursor_leftovers(self):
         with tempfile.TemporaryDirectory() as directory:
             skill = Path(directory) / "demo"

@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- A README covering what pstack-t3 does, real run excerpts, a table of example prompts, a diagram, and an FAQ.
+- A [guide](docs/guide.md) to the first hour, a [how-it-works](docs/how-it-works.md) page, and a generated [skills catalog](docs/skills.md) that the build keeps in sync.
+- A banner and a social preview image in `docs/assets/`.
+
 ## 0.1.0
 
 First public release, ported from upstream pstack 0.15.6 ([cursor/plugins@23e4138](https://github.com/cursor/plugins/tree/23e4138daa01c42d4969f7a5465f82704e64f798/pstack)).
