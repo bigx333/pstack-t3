@@ -110,7 +110,7 @@ Pass `--parent` with the values from `orchestrator_capabilities`. The saved cata
 | `reflect tooling` | 1 | reflect |
 | `reflect judgment, divergent, synthesizer` | 1 | reflect |
 | `arena runners` | N | arena, one candidate per seat |
-| `arena cross-judge pool` | N | arena, pick one seat whose provider differs from the parent's |
+| `arena cross-judge pool` | N | arena, pick one seat whose model family differs from the parent's |
 | `swarm workers` | 1 | swarm, default model for every worker |
 | `architect runners` | N | architect, one runner per seat |
 | `interrogate reviewers` | N | interrogate, one reviewer per seat |

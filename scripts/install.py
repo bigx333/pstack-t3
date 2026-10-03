@@ -74,13 +74,15 @@ def save_manifest(file, manifest):
 
 
 def plan(targets, names):
-    """Return (actions, conflicts). Directories sharing a real path are visited once."""
-    actions, conflicts, seen = [], [], set()
+    """Return (actions, conflicts). Directories sharing a real path are visited once,
+    and each action names every harness that shares it."""
+    actions, conflicts, seen = [], [], {}
     for harness, directory in targets.items():
         real = Path(os.path.realpath(directory))
         if real in seen:
+            seen[real].append(harness)
             continue
-        seen.add(real)
+        seen[real] = [harness]
         if inside_checkout(directory):
             print(f"{harness}: {directory} already resolves to {SKILLS}; nothing to link")
             continue
@@ -92,8 +94,8 @@ def plan(targets, names):
                 # Moving this aside would move pstack-t3's own skill directory.
                 continue
             if link.exists() or link.is_symlink():
-                conflicts.append((harness, link))
-            actions.append((harness, link))
+                conflicts.append((seen[real], link))
+            actions.append((seen[real], link))
     return actions, conflicts
 
 
@@ -106,11 +108,11 @@ def install(args):
     names = sorted(p.name for p in SKILLS.iterdir() if (p / "SKILL.md").is_file())
     actions, conflicts = plan(targets, names)
     if conflicts and not args.replace:
-        lines = [f"  {harness}: {link} ({describe(link)})" for harness, link in conflicts]
+        lines = [f"  {'/'.join(harnesses)}: {link} ({describe(link)})" for harnesses, link in conflicts]
         sys.exit("these skills already exist; rerun with --replace to move them aside (uninstall restores them):\n" + "\n".join(lines))
     if args.dry_run:
-        for harness, link in actions:
-            print(f"would link {link} -> {SKILLS / link.name}" + (f" (replacing {describe(link)})" if (harness, link) in conflicts else ""))
+        for harnesses, link in actions:
+            print(f"would link {link} -> {SKILLS / link.name}" + (f" (replacing {describe(link)})" if (harnesses, link) in conflicts else ""))
         print(f"{len(actions)} links planned")
         return
     state = state_dir(scope, user)
@@ -118,24 +120,29 @@ def install(args):
     manifest = load_manifest(manifest_file)
     (state / "backups").mkdir(parents=True, exist_ok=True)
     backup_root = Path(tempfile.mkdtemp(prefix=time.strftime("%Y%m%dT%H%M%S-"), dir=state / "backups"))
-    for harness, link in actions:
+    for harnesses, link in actions:
         link.parent.mkdir(parents=True, exist_ok=True)
         if link.exists() or link.is_symlink():
-            backup = backup_root / harness / link.name
+            backup = backup_root / harnesses[0] / link.name
             backup.parent.mkdir(parents=True, exist_ok=True)
             # Record before moving, so a crash mid-move still leaves a restorable entry.
-            manifest["backups"].append({"harness": harness, "original": str(link), "backup": str(backup)})
+            manifest["backups"].append({"harnesses": harnesses, "original": str(link), "backup": str(backup)})
             save_manifest(manifest_file, manifest)
             shutil.move(str(link), str(backup))
         link.symlink_to(SKILLS / link.name, target_is_directory=True)
-        manifest["links"].append({"harness": harness, "path": str(link)})
+        manifest["links"].append({"harnesses": harnesses, "path": str(link)})
         save_manifest(manifest_file, manifest)
-    print(f"linked {len(actions)} skills into {', '.join(sorted(set(h for h, _ in actions))) or 'nothing (already installed)'}")
+    print(f"linked {len(actions)} skills into {', '.join(sorted(set(h for hs, _ in actions for h in hs))) or 'nothing (already installed)'}")
     print(f"manifest: {manifest_file}")
 
 
-def entry_harness(entry):
-    return entry.get("harness") if isinstance(entry, dict) else None
+def entry_harnesses(entry):
+    """Harnesses that share an entry's directory. Unknown means all of them."""
+    if not isinstance(entry, dict):
+        return list(HARNESSES)
+    if "harnesses" in entry:
+        return entry["harnesses"]
+    return [entry["harness"]] if "harness" in entry else list(HARNESSES)
 
 
 def entry_path(entry):
@@ -147,7 +154,16 @@ def uninstall(args):
     scope = Path(args.project).resolve() if args.project else None
     manifest_file = state_dir(scope, user) / "install-manifest.json"
     manifest = load_manifest(manifest_file)
-    selected = lambda entry: entry_harness(entry) in (None, *args.harness)
+    shared = set()
+
+    def selected(entry):
+        # A directory shared by several harnesses goes only when all of them are selected.
+        harnesses = entry_harnesses(entry)
+        if set(harnesses) <= set(args.harness):
+            return True
+        if set(harnesses) & set(args.harness):
+            shared.add(", ".join(sorted(set(harnesses) - set(args.harness))))
+        return False
     removed, kept_links = 0, []
     for entry in manifest["links"]:
         link = entry_path(entry)
@@ -175,6 +191,8 @@ def uninstall(args):
             shutil.move(str(backup), str(original))
         restored += 1
     print(f"would remove {removed} links, would restore {restored} entries" if args.dry_run else f"removed {removed} links, restored {restored} entries")
+    for others in sorted(shared):
+        print(f"kept entries whose directory is shared with {others}; select those harnesses too to remove them")
     if args.dry_run:
         return 0
     if kept_links or kept_backups:
@@ -192,8 +210,12 @@ def doctor(args):
     for harness, directory in skill_dirs(scope, user).items():
         if harness not in args.harness:
             continue
-        if inside_checkout(directory):
+        if Path(os.path.realpath(directory)) == Path(os.path.realpath(SKILLS)):
             print(f"{harness:7} {directory}: resolves to the pstack-t3 skills tree itself")
+            continue
+        if inside_checkout(directory):
+            print(f"{harness:7} {directory}: points inside one pstack-t3 skill, so the other skills are invisible")
+            healthy = False
             continue
         installed = [n for n in names if ours(directory / n)]
         foreign = [n for n in names if (directory / n).exists() and not ours(directory / n)]

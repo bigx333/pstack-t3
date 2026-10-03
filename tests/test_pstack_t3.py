@@ -57,6 +57,9 @@ class RolesTest(unittest.TestCase):
         seats = roles.resolve(config("small"), CATALOG, ["bug-fix"])["roles"]["bug-fix"]["seats"]
         self.assertEqual(seats, [{"providerInstanceId": "claudeAgent", "model": "claude-opus-5-5", "options": {"effort": "medium"}}])
         self.assertEqual(roles.resolve(config(), CATALOG, ["bug-fix"])["roles"]["bug-fix"]["seats"], ["inherit"])
+        entry = roles.resolve(config("small"), CATALOG, ["bug-fix"])["roles"]["bug-fix"]
+        self.assertNotIn("notes", entry)
+        self.assertIn("inherit made explicit", entry["info"][0])
 
     def test_budget_understands_extra_high_and_keeps_none(self):
         model = {"id": "m", "options": [{"id": "reasoning_effort", "type": "select", "options": [{"id": "none"}, {"id": "low"}, {"id": "high"}, {"id": "extra-high"}]}]}
@@ -259,6 +262,26 @@ class InstallTest(unittest.TestCase):
             self.assertFalse((ROOT / "skills/swarm").is_symlink())
             self.assertEqual(self.run_install(home, "uninstall").returncode, 0)
             self.assertTrue((ROOT / "skills/swarm/SKILL.md").is_file())
+
+    def test_shared_directory_uninstalls_only_when_every_sharing_harness_is_selected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            (home / ".agents/skills").mkdir(parents=True)
+            (home / ".grok").mkdir()
+            (home / ".grok/skills").symlink_to(home / ".agents/skills")
+            self.assertEqual(self.run_install(home, "--harness", "codex,grok").returncode, 0)
+            partial = self.run_install(home, "uninstall", "--harness", "grok")
+            self.assertIn("shared with codex", partial.stdout)
+            self.assertTrue((home / ".agents/skills/swarm").is_symlink())
+            self.assertEqual(self.run_install(home, "uninstall", "--harness", "codex,grok").returncode, 0)
+            self.assertFalse((home / ".agents/skills/swarm").exists())
+
+    def test_doctor_fails_when_a_skills_dir_points_inside_one_skill(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            (home / ".grok").mkdir()
+            (home / ".grok/skills").symlink_to(ROOT / "skills/swarm")
+            self.assertNotEqual(self.run_install(home, "doctor", "--harness", "grok").returncode, 0)
 
     def test_shared_real_directory_is_linked_once(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -4,7 +4,10 @@
 import re
 import sys
 
-import yaml
+try:
+    import yaml
+except ImportError:  # the build still runs; frontmatter gets the shallow check only
+    yaml = None
 from pathlib import Path
 
 # Each pattern names a Cursor-only mechanism and its T3 replacement.
@@ -38,8 +41,9 @@ def check_tree(root):
             findings.append(f"{skill}/SKILL.md: missing frontmatter")
             continue
         try:
-            keys = yaml.safe_load(match.group(1))
-        except yaml.YAMLError as error:
+            keys = yaml.safe_load(match.group(1)) if yaml else dict(
+                (k.strip(), v.strip().strip('"')) for k, v in (line.split(":", 1) for line in match.group(1).splitlines() if ":" in line and not line.startswith(" ")))
+        except Exception as error:
             findings.append(f"{skill}/SKILL.md: frontmatter is not valid YAML: {str(error).splitlines()[0]}")
             continue
         if not isinstance(keys, dict):

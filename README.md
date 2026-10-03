@@ -105,7 +105,7 @@ python3 skills/pstack-runtime/scripts/roles.py show --role "interrogate reviewer
 ```
 
 - A project can override any role in `.pstack/t3-roles.json`.
-- The budget (`default`, `small`, `medium`, `large`, `unlimited`) caps each seat's reasoning option.
+- The budget (`default`, `small`, `medium`, `large`, `unlimited`) sets each seat's reasoning option to its level. A seat that names a lower level keeps it.
 - A seat whose provider is not runnable inherits the parent, and a model T3 dropped falls back to that provider's first model. Each fallback is reported, never silent.
 
 ## Develop

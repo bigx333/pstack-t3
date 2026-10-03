@@ -258,13 +258,13 @@ def resolve_seat(seat, catalog, budget):
     """Return (resolved seat, notes, problems). Problems are seats the catalog rejects."""
     if seat == INHERIT:
         value, note = inherit_with_budget(catalog, budget)
-        return value, [note] if note else [], []
+        return value, [{"info": note}] if note else [], []
     provider = providers_by_id(catalog).get(seat["providerInstanceId"])
     if not runnable(provider):
         reason = "; ".join(provider.get("constraints") or []) if provider else "not in catalog"
         note = f"{seat['providerInstanceId']} is not runnable ({reason}); seat inherits the parent"
         value, budget_note = inherit_with_budget(catalog, budget)
-        return value, [note] + ([budget_note] if budget_note else []), [note]
+        return value, [note] + ([{"info": budget_note}] if budget_note else []), [note]
     notes, problems = [], []
     model = find_model(provider, seat["model"])
     if model is None:
@@ -314,8 +314,12 @@ def resolve(config, catalog=None, names=None):
                 resolved.append(value)
                 notes.extend(seat_notes)
             entry["seats"] = resolved
-            if notes:
-                entry["notes"] = notes
+            info = [note["info"] for note in notes if isinstance(note, dict)]
+            problems = [note for note in notes if not isinstance(note, dict)]
+            if problems:
+                entry["notes"] = problems
+            if info:
+                entry["info"] = info
         result["roles"][name] = entry
     return result
 

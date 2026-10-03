@@ -37,7 +37,7 @@ This prints every role with its seats and `source` (`default`, the user file, or
 - `medium — high reasoning`
 - `small — medium reasoning`
 
-The budget caps the reasoning option (`effort`, `reasoningEffort`, or `reasoning`) of every seat. A model without such an option is unaffected. `ultracode` and `ultrathink` are never set by a budget.
+The budget sets the reasoning option (`effort`, `reasoningEffort`, `reasoning_effort`, or `reasoning`) of every seat to its level, or the closest lower level the model offers. A seat that names a lower level keeps it. A model without such an option is unaffected. `ultracode` and `ultrathink` are never set by a budget.
 
 **(b) Propose roles.** Start from the current state. Then suggest a split by strength that uses only runnable providers. A good default when several providers are runnable:
 
@@ -70,7 +70,7 @@ The provider and model IDs above are examples. Use IDs from step 1.
 
 ### 5. Verify
 
-Run `python3 <runtime>/scripts/roles.py show --cwd "$PWD"` and check that every role shows the seats you wrote, with no `notes`. Then run one smoke delegation to each distinct provider in the table: `delegate_task` with `mode: "wait"`, `timeoutMs: 120000`, the seat's target, and the task "Reply with the single word ready." A seat that fails here is not usable. Fix it and rerun step 4.
+Run `python3 <runtime>/scripts/roles.py show --cwd "$PWD" --parent "<inheritedProviderInstanceId>/<inheritedModel>"` and check that every role shows the seats you wrote, with no `notes`. `info` lines, such as an `inherit` seat made explicit for the budget, are expected. Then run one smoke delegation to each distinct provider in the table: `delegate_task` with `mode: "wait"`, `timeoutMs: 120000`, the seat's target, and the task "Reply with the single word ready." A seat that fails here is not usable. Fix it and rerun step 4.
 
 ### 6. Confirm
 
