@@ -1,0 +1,11 @@
+### Pause safely
+
+**You own a clean stop. Leave a checkpoint a cold-start agent can resume from.** This is explicit only. On "keep going", "going to bed, keep going", or "don't stop", do not pause. Pause before a T3 restart, a provider or model switch on this thread, context compaction, or a hand-off to another thread.
+
+1. Stop at a safe boundary. Finish the current atomic step or back out of it. Start nothing new, and cancel any nested child tasks with `task_cancel`. Record each cancelled `taskId` and its `childThreadId` in the resume note, since the pickup reads those threads.
+2. Take no irreversible action to pause. No PR and no push unless you already had one out.
+3. Make the work durable. Commit uncommitted edits as one clear `wip:` commit on the current branch so nothing is lost. If the tree is broken, say so in the commit body in one line.
+4. Stop the work's schedules. Call `list_scheduled_tasks` and find every schedule this work owns, such as a babysit tick or an autonomous-run heartbeat. Pause each with `update_scheduled_task` and `enabled: false` when the work resumes later, or delete it with `delete_scheduled_task` when the work is abandoned. A schedule left running fires into a paused or restarted thread with stale state. Record each `scheduledTaskId` and its state in the resume note.
+5. Write the resume note off-context, where `playbooks/session-pickup.md` looks. Write it to `.pstack/resume/<slug>.md` at the worktree root, and do not commit it. Then post the same note, with its path, as this thread's final message, because the pickup reads the thread's last messages first with `t3_thread_read`. Capture intent, what you were doing, progress and what's verified, current state (branch, worktree path, head SHA, linked PRs from `list_thread_pull_requests`), paused schedules, next steps, key files, and gotchas. If a show-me-your-work trail exists, point at it instead of duplicating it.
+
+**Reply:** where you are in the loop, what's on disk versus still in your head (paths, no diff dumps), the commits you made and whether the tree is clean, each schedule you paused or deleted, the resume note path, and the first action on resume. This is a pause, not a final report.

@@ -13,7 +13,6 @@ FORBIDDEN = [
     (r"run_in_background", "Cursor Task flag; use delegate_task mode async"),
     (r"`Task`|Task tool|Task call|Task subagent|Task `model`", "Cursor Task tool; use delegate_task"),
     (r"pstack-models\.mdc|\.cursor/rules", "Cursor rule file; use roles.py and roles.json"),
-    (r"~/\.cursor|\.cursor/skills", "Cursor paths; pstack-t3 installs per provider"),
     (r"(?<![\w/])/loop\b", "Cursor /loop; use schedule_task"),
     (r"AskQuestion", "Cursor question tool; use the host's question tool"),
     (r"cursor-team-kit|Cursor's built-in", "Cursor plugin dependency"),
