@@ -86,8 +86,10 @@ Roles let one skill run on whatever providers the user has. A role value is a li
 Print the merged roles for the current project with:
 
 ```bash
-python3 <pstack-runtime>/scripts/roles.py show --cwd "$PWD"
+python3 <pstack-runtime>/scripts/roles.py show --cwd "$PWD" --parent "<inheritedProviderInstanceId>/<inheritedModel>"
 ```
+
+Pass `--parent` with the values from `orchestrator_capabilities`. The saved catalog records whichever thread ran setup, so without `--parent` the default panels treat no seat as this thread's own.
 
 `<pstack-runtime>` is the directory holding this file. It sits next to every other pstack skill directory, so from a skill at `<dir>/swarm/SKILL.md` it is `<dir>/pstack-runtime`. Add `--role "<name>"` for one role. The output is small JSON with `source` per role. It resolves against the catalog snapshot that `setup-pstack` saved, if any. A panel role that shows `"seats": "default-panel"` has no config and no snapshot. Expand it yourself from the `orchestrator_capabilities` result per the defaults below.
 
@@ -119,13 +121,14 @@ python3 <pstack-runtime>/scripts/roles.py show --cwd "$PWD"
 The defaults depend on nothing but the live catalog, so they never name a model the user lacks.
 
 - Single-seat roles default to `["inherit"]`.
-- Panel roles (`arena runners`, `arena cross-judge pool`, `architect runners`, `interrogate reviewers`, `verifiers`) default to one seat per provider whose `canRunChildTask` is true, using that provider's first listed model with its default options. The parent's own provider seat is `"inherit"`. With only one runnable provider, the panel is three `"inherit"` seats, and the report must say the models did not differ.
+- Panel roles (`arena runners`, `arena cross-judge pool`, `architect runners`, `interrogate reviewers`, `verifiers`) default to `"inherit"` for this thread's seat, then one seat per runnable provider (`canRunChildTask: true`), using that provider's first listed model with its default options, skipping a provider whose first model belongs to a family already seated.
+- A model family is the leading word of the model ID: `claude-opus-5-5` is `claude`, `gpt-6.1-sol` is `gpt`, `grok-4.7` is `grok`. Diversity rules in pstack compare families, never providers, because one provider can serve another's models. With only one runnable provider, the panel is three `"inherit"` seats, and the report must say the models did not differ.
 
 Agreement between seats on the same model is weak evidence. It shows the prompt is stable, not that the finding is right. Weigh consensus only across seats on different models, and say which kind you have.
 
 ### Budget
 
-The config may carry `"budget"`: `default`, `small`, `medium`, `large`, or `unlimited`. It caps the reasoning option of every seat that has one (`effort`, `reasoningEffort`, or `reasoning`) at `medium`, `high`, `xhigh`, or the highest non-special value. `default` leaves options alone. `ultracode` and `ultrathink` are never chosen by a budget. `roles.py show` reports the budgeted options.
+The config may carry `"budget"`: `default`, `small`, `medium`, `large`, or `unlimited`. It caps the reasoning option of every seat that has one (`effort`, `reasoningEffort`, or `reasoning`) at `medium`, `high`, `xhigh`, or the highest non-special value. `default` leaves options alone. `ultracode` and `ultrathink` are never chosen by a budget. A lower explicit choice is kept. Under any budget other than `default`, an `inherit` seat becomes an explicit target on this thread's provider and model with the capped option, because an omitted `target` would pass the parent's reasoning level through. `roles.py show` reports the budgeted seats.
 
 ### Fallback
 
@@ -186,7 +189,7 @@ Private working state that must survive the session but never be committed lives
 
 Resume notes from Pause safely go to `.pstack/resume/<slug>.md` in the repository, untracked (add `.pstack/` to `.git/info/exclude`), and are also posted as the thread's final message.
 
-After a T3 restart, assume a child is gone unless `task_status` shows it `working`. Pushed branches, worktrees, launched threads, and schedules persist. Reattach through `t3_thread_list` and `list_scheduled_tasks`.
+After a T3 restart, assume a child is gone unless `task_status` shows `working` or `waiting_for_children`. Pushed branches, worktrees, launched threads, and schedules persist. Reattach through `t3_thread_list` and `list_scheduled_tasks`.
 
 ## Verification surfaces
 

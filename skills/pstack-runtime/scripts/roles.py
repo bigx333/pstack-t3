@@ -9,6 +9,7 @@ T3's orchestrator_capabilities tool returns.
 import argparse
 import json
 import os
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -37,8 +38,8 @@ PANEL_ROLES = [
 ]
 ROLES = SINGLE_ROLES + PANEL_ROLES
 BUDGETS = {"default": None, "small": "medium", "medium": "high", "large": "xhigh", "unlimited": "max-available"}
-EFFORT_IDS = ("effort", "reasoningEffort", "reasoning")
-LADDER = ["low", "medium", "high", "xhigh", "max", "ultra"]
+EFFORT_IDS = ("effort", "reasoningEffort", "reasoning_effort", "reasoning")
+LADDER = {"none": 0, "minimal": 1, "low": 2, "medium": 3, "high": 4, "xhigh": 5, "extra-high": 5, "extra_high": 5, "max": 6, "ultra": 7}
 SPECIAL = {"ultracode", "ultrathink"}
 INHERIT = "inherit"
 
@@ -148,16 +149,51 @@ def providers_by_id(catalog):
     return {provider["providerInstanceId"]: provider for provider in catalog["providers"]}
 
 
+def models_of(provider):
+    return (provider or {}).get("models") or []
+
+
+def options_of(model):
+    return (model or {}).get("options") or []
+
+
 def runnable(provider):
-    return bool(provider and provider.get("canRunChildTask") and provider.get("models"))
+    return bool(provider and provider.get("canRunChildTask") and models_of(provider))
 
 
 def find_model(provider, model_id):
-    return next((model for model in provider.get("models", []) if model["id"] == model_id), None)
+    return next((model for model in models_of(provider) if model["id"] == model_id), None)
+
+
+def rank(value):
+    return LADDER.get(value)
+
+
+def family(model_id):
+    """Model family from the model id's leading word: claude-opus-5-5 -> claude."""
+    head = re.split(r"[-_.\d]", model_id.lower(), maxsplit=1)[0]
+    return head or model_id.lower()
 
 
 def effort_option(model):
-    return next((option for option in model.get("options", []) if option["id"] in EFFORT_IDS and option.get("type") == "select"), None)
+    return next((option for option in options_of(model) if option["id"] in EFFORT_IDS and option.get("type") == "select"), None)
+
+
+def check_option_values(seat, model):
+    """Return problems for option values the catalog does not offer."""
+    problems = []
+    declared = {option["id"]: option for option in options_of(model)}
+    for key, value in (seat.get("options") or {}).items():
+        option = declared.get(key)
+        if option is None:
+            continue
+        if option.get("type") == "boolean" and not isinstance(value, bool):
+            problems.append(f"option {key}={value!r} must be true or false")
+        elif option.get("type") == "select":
+            choices = [choice["id"] for choice in option.get("options") or []]
+            if value not in choices:
+                problems.append(f"option {key}={value!r} is not one of {', '.join(choices)}")
+    return problems
 
 
 def apply_budget(seat, model, budget):
@@ -165,59 +201,89 @@ def apply_budget(seat, model, budget):
     option = effort_option(model) if model else None
     if cap is None or option is None:
         return seat
-    values = [choice["id"] for choice in option["options"] if choice["id"] not in SPECIAL and choice["id"] in LADDER]
+    values = [choice["id"] for choice in option.get("options") or [] if choice["id"] not in SPECIAL and rank(choice["id"]) is not None]
     if not values:
         return seat
-    ceiling = max(values, key=LADDER.index) if cap == "max-available" else cap
-    allowed = [value for value in values if LADDER.index(value) <= LADDER.index(ceiling)]
-    if not allowed:
-        allowed = [min(values, key=LADDER.index)]
+    ceiling = max(rank(value) for value in values) if cap == "max-available" else rank(cap)
+    allowed = [value for value in values if rank(value) <= ceiling] or [min(values, key=rank)]
     current = (seat.get("options") or {}).get(option["id"])
-    chosen = current if current in allowed else max(allowed, key=LADDER.index)
+    if current in values and rank(current) <= ceiling:
+        chosen = current
+    else:
+        chosen = max(allowed, key=rank)
     return {**seat, "options": {**(seat.get("options") or {}), option["id"]: chosen}}
 
 
 def default_seats(name, catalog):
+    """One seat per runnable provider whose first model is a family not yet seated."""
     if name in SINGLE_ROLES:
         return [INHERIT]
     parent = catalog.get("inheritedProviderInstanceId")
-    seats = []
+    parent_model = catalog.get("inheritedModel")
+    seats, families = [], set()
+    if parent and parent_model:
+        seats.append(INHERIT)
+        families.add(family(parent_model))
     for provider in catalog["providers"]:
-        if not runnable(provider):
+        if not runnable(provider) or provider["providerInstanceId"] == parent:
             continue
-        if provider["providerInstanceId"] == parent:
-            seats.append(INHERIT)
-        else:
-            seats.append({"providerInstanceId": provider["providerInstanceId"], "model": provider["models"][0]["id"]})
+        model = models_of(provider)[0]["id"]
+        if family(model) in families:
+            continue
+        families.add(family(model))
+        seats.append({"providerInstanceId": provider["providerInstanceId"], "model": model})
     if len(seats) <= 1:
         return [INHERIT, INHERIT, INHERIT]
     return seats
 
 
-def resolve_seat(seat, catalog, budget):
-    """Return (resolved seat, note or None)."""
-    if seat == INHERIT:
+def inherit_with_budget(catalog, budget):
+    """An inherit seat under a non-default budget becomes the parent's model with capped effort."""
+    parent = catalog.get("inheritedProviderInstanceId")
+    parent_model = catalog.get("inheritedModel")
+    if BUDGETS[budget] is None or not parent or not parent_model:
         return INHERIT, None
-    providers = providers_by_id(catalog)
-    provider = providers.get(seat["providerInstanceId"])
+    model = find_model(providers_by_id(catalog).get(parent), parent_model)
+    if model is None or effort_option(model) is None:
+        return INHERIT, None
+    seat = apply_budget({"providerInstanceId": parent, "model": parent_model}, model, budget)
+    return seat, f"inherit made explicit as {parent}/{parent_model} so the {budget} budget applies"
+
+
+def resolve_seat(seat, catalog, budget):
+    """Return (resolved seat, notes, problems). Problems are seats the catalog rejects."""
+    if seat == INHERIT:
+        value, note = inherit_with_budget(catalog, budget)
+        return value, [note] if note else [], []
+    provider = providers_by_id(catalog).get(seat["providerInstanceId"])
     if not runnable(provider):
-        reason = "; ".join(provider.get("constraints", [])) if provider else "not in catalog"
-        return INHERIT, f"{seat['providerInstanceId']} is not runnable ({reason}); seat inherits the parent"
+        reason = "; ".join(provider.get("constraints") or []) if provider else "not in catalog"
+        note = f"{seat['providerInstanceId']} is not runnable ({reason}); seat inherits the parent"
+        value, budget_note = inherit_with_budget(catalog, budget)
+        return value, [note] + ([budget_note] if budget_note else []), [note]
+    notes, problems = [], []
     model = find_model(provider, seat["model"])
-    note = None
     if model is None:
-        model = provider["models"][0]
+        model = models_of(provider)[0]
         note = f"{seat['providerInstanceId']}/{seat['model']} is not in the catalog; using {model['id']}"
+        notes.append(note)
+        problems.append(note)
         seat = {"providerInstanceId": provider["providerInstanceId"], "model": model["id"]}
-    known = {option["id"] for option in model.get("options", [])}
-    options = {key: value for key, value in (seat.get("options") or {}).items() if key in known}
+    known = {option["id"] for option in options_of(model)}
     dropped = sorted(set(seat.get("options") or {}) - known)
     if dropped:
-        note = (note + "; " if note else "") + f"dropped unknown options {', '.join(dropped)}"
+        note = f"dropped unknown options {', '.join(dropped)}"
+        notes.append(note)
+        problems.append(note)
+    invalid = check_option_values(seat, model)
+    problems.extend(invalid)
+    notes.extend(f"dropped {problem}" for problem in invalid)
+    bad = {problem.split("=", 1)[0].removeprefix("option ") for problem in invalid}
+    options = {key: value for key, value in (seat.get("options") or {}).items() if key in known and key not in bad}
     seat = {key: value for key, value in seat.items() if key != "options"}
     if options:
         seat["options"] = options
-    return apply_budget(seat, model, budget), note
+    return apply_budget(seat, model, budget), notes, problems
 
 
 def resolve(config, catalog=None, names=None):
@@ -227,26 +293,25 @@ def resolve(config, catalog=None, names=None):
         if name not in ROLES:
             raise RolesError(f"unknown role {name!r}")
         configured = config["roles"].get(name)
-        source = config["sources"].get(name, "default")
-        entry = {"source": source}
-        if configured is None and catalog is None:
-            entry["seats"] = [INHERIT] if name in SINGLE_ROLES else "default-panel"
-            if name in PANEL_ROLES:
-                entry["note"] = "one seat per runnable provider from orchestrator_capabilities, first listed model; parent provider seat inherits"
+        entry = {"source": config["sources"].get(name, "default")}
+        if catalog is None:
+            if configured is not None:
+                entry["seats"] = configured
+            elif name in SINGLE_ROLES:
+                entry["seats"] = [INHERIT]
+            else:
+                entry["seats"] = "default-panel"
+                entry["note"] = "expand from orchestrator_capabilities: this thread inherits, then one seat per runnable provider whose first model is a new model family"
         else:
             seats = configured if configured is not None else default_seats(name, catalog)
-            if catalog is None:
-                entry["seats"] = seats
-            else:
-                resolved, notes = [], []
-                for seat in seats:
-                    value, note = resolve_seat(seat, catalog, config["budget"])
-                    resolved.append(value)
-                    if note:
-                        notes.append(note)
-                entry["seats"] = resolved
-                if notes:
-                    entry["notes"] = notes
+            resolved, notes = [], []
+            for seat in seats:
+                value, seat_notes, _ = resolve_seat(seat, catalog, config["budget"])
+                resolved.append(value)
+                notes.extend(seat_notes)
+            entry["seats"] = resolved
+            if notes:
+                entry["notes"] = notes
         result["roles"][name] = entry
     return result
 
@@ -263,9 +328,8 @@ def validate(config, catalog):
     problems = []
     for name, seats in config["roles"].items():
         for seat in seats:
-            _, note = resolve_seat(seat, catalog, config["budget"])
-            if note:
-                problems.append(f"{name}: {note}")
+            _, _, seat_problems = resolve_seat(seat, catalog, config["budget"])
+            problems.extend(f"{name}: {problem}" for problem in seat_problems)
     return problems
 
 
@@ -273,6 +337,10 @@ def command_show(args):
     config = merged_config(args.cwd, args.config, args.project_config)
     catalog_path = args.catalog or (snapshot_path() if snapshot_path().is_file() else None)
     catalog = load_catalog(catalog_path) if catalog_path else None
+    if catalog is not None and (args.parent or not args.catalog):
+        # A saved snapshot records whichever thread ran setup, not this one.
+        provider, _, model = (args.parent or "").partition("/")
+        catalog = {**catalog, "inheritedProviderInstanceId": provider or None, "inheritedModel": model or None}
     print(json.dumps(resolve(config, catalog, [args.role] if args.role else None), indent=2))
 
 
@@ -318,6 +386,7 @@ def main(argv=None):
             command.add_argument("--project-config", help="project roles file (default <repo>/.pstack/t3-roles.json)")
         command.add_argument("--catalog", required=name != "show", help="saved orchestrator_capabilities JSON, or - for stdin")
     sub.choices["show"].add_argument("--role")
+    sub.choices["show"].add_argument("--parent", help="this thread's provider/model from orchestrator_capabilities (inheritedProviderInstanceId/inheritedModel)")
     write = sub.choices["write"]
     write.add_argument("--budget", choices=list(BUDGETS))
     write.add_argument("--set", action="append", help="'<role>=<seat>[;<seat>]', seat = inherit | provider/model[?option=value]")

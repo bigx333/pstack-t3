@@ -11,6 +11,7 @@ import json
 import os
 import shutil
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -98,19 +99,30 @@ def install(args):
     state = state_dir(scope, user)
     manifest_file = state / "install-manifest.json"
     manifest = load_manifest(manifest_file)
-    backup_root = state / "backups" / time.strftime("%Y%m%dT%H%M%S")
+    (state / "backups").mkdir(parents=True, exist_ok=True)
+    backup_root = Path(tempfile.mkdtemp(prefix=time.strftime("%Y%m%dT%H%M%S-"), dir=state / "backups"))
     for harness, link in actions:
         link.parent.mkdir(parents=True, exist_ok=True)
         if link.exists() or link.is_symlink():
             backup = backup_root / harness / link.name
             backup.parent.mkdir(parents=True, exist_ok=True)
+            # Record before moving, so a crash mid-move still leaves a restorable entry.
+            manifest["backups"].append({"harness": harness, "original": str(link), "backup": str(backup)})
+            save_manifest(manifest_file, manifest)
             shutil.move(str(link), str(backup))
-            manifest["backups"].append({"original": str(link), "backup": str(backup)})
         link.symlink_to(SKILLS / link.name, target_is_directory=True)
-        manifest["links"].append(str(link))
+        manifest["links"].append({"harness": harness, "path": str(link)})
         save_manifest(manifest_file, manifest)
     print(f"linked {len(actions)} skills into {', '.join(sorted(set(h for h, _ in actions))) or 'nothing (already installed)'}")
     print(f"manifest: {manifest_file}")
+
+
+def entry_harness(entry):
+    return entry.get("harness") if isinstance(entry, dict) else None
+
+
+def entry_path(entry):
+    return Path(entry["path"] if isinstance(entry, dict) else entry)
 
 
 def uninstall(args):
@@ -118,21 +130,41 @@ def uninstall(args):
     scope = Path(args.project).resolve() if args.project else None
     manifest_file = state_dir(scope, user) / "install-manifest.json"
     manifest = load_manifest(manifest_file)
-    removed = 0
+    selected = lambda entry: entry_harness(entry) in (None, *args.harness)
+    removed, kept_links = 0, []
     for entry in manifest["links"]:
-        link = Path(entry)
-        if ours(link):
-            link.unlink()
+        link = entry_path(entry)
+        if not selected(entry):
+            kept_links.append(entry)
+        elif ours(link):
+            if not args.dry_run:
+                link.unlink()
             removed += 1
-    restored = 0
+    restored, kept_backups = 0, []
     for entry in reversed(manifest["backups"]):
         original, backup = Path(entry["original"]), Path(entry["backup"])
-        if (backup.exists() or backup.is_symlink()) and not (original.exists() or original.is_symlink()):
+        present = backup.exists() or backup.is_symlink()
+        if not selected(entry) or not present:
+            if present:
+                kept_backups.append(entry)
+            continue
+        occupied = original.exists() or original.is_symlink()
+        # In a dry run our own links are still in place but would be removed first.
+        if occupied and not (args.dry_run and ours(original)):
+            print(f"kept backup {backup}: {original} is occupied; clear it and rerun uninstall")
+            kept_backups.append(entry)
+            continue
+        if not args.dry_run:
             shutil.move(str(backup), str(original))
-            restored += 1
-    if manifest_file.exists():
+        restored += 1
+    print(f"would remove {removed} links, would restore {restored} entries" if args.dry_run else f"removed {removed} links, restored {restored} entries")
+    if args.dry_run:
+        return 0
+    if kept_links or kept_backups:
+        save_manifest(manifest_file, {"links": kept_links, "backups": list(reversed(kept_backups))})
+    elif manifest_file.exists():
         manifest_file.unlink()
-    print(f"removed {removed} links, restored {restored} entries")
+    return 0
 
 
 def doctor(args):
@@ -148,8 +180,16 @@ def doctor(args):
         missing = [n for n in names if not (directory / n).exists()]
         healthy &= not foreign and not missing
         print(f"{harness:7} {directory}: {len(installed)}/{len(names)} pstack-t3" +
-              (f", {len(foreign)} shadowed by other copies ({', '.join(foreign[:5])}{'...' if len(foreign) > 5 else ''})" if foreign else "") +
+              (f", {len(foreign)} taken by other copies ({', '.join(foreign[:5])}{'...' if len(foreign) > 5 else ''})" if foreign else "") +
               (f", {len(missing)} missing" if missing else ""))
+        if not user:
+            # Claude and Grok load the user copy when both scopes define a name.
+            user_directory = skill_dirs(None, True)[harness]
+            shadowing = [n for n in installed if (user_directory / n).exists() and not ours(user_directory / n)]
+            if shadowing:
+                healthy = False
+                print(f"        user scope {user_directory} has other copies of {len(shadowing)} of these "
+                      f"({', '.join(shadowing[:5])}{'...' if len(shadowing) > 5 else ''}); providers that prefer user scope will load those instead")
     return 0 if healthy else 1
 
 

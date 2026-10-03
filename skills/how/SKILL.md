@@ -9,7 +9,7 @@ Read [the pstack-t3 runtime](../pstack-runtime/SKILL.md) before spawning workers
 
 Explore the codebase to answer "how does X work?" questions. Produce architectural explanations at the level of a senior engineer onboarding onto a subsystem, enough to build a working mental model, not so much that it reads like annotated source code.
 
-Each spawn below names a role, resolved per [the runtime's Roles section](../pstack-runtime/SKILL.md#roles) with `python3 <pstack-runtime>/scripts/roles.py show --cwd "$PWD" --role "<role>"`. Set `target` to the role's seat, or omit `target` when the seat is `inherit`. If `delegate_task` rejects a target, apply the runtime's fallback and say which seat changed and why. Every spawn uses `mode: "async"`, a stable `clientRequestId` such as `how-<slug>-<angle>`, and a read-only brief. The prompt templates tell the child not to edit files, commit, or push. Retain every returned `taskId`.
+Each spawn below names a role, resolved per [the runtime's Roles section](../pstack-runtime/SKILL.md#roles) with `python3 <pstack-runtime>/scripts/roles.py show --cwd "$PWD" --parent "<inheritedProviderInstanceId>/<inheritedModel>" --role "<role>"`. Set `target` to the role's seat, or omit `target` when the seat is `inherit`. If `delegate_task` rejects a target, apply the runtime's fallback and say which seat changed and why. Every spawn uses `mode: "async"`, a stable `clientRequestId` such as `how-<slug>-<angle>`, and a read-only brief. The prompt templates tell the child not to edit files, commit, or push. Retain every returned `taskId`.
 
 ## Step 1. Assess Complexity
 

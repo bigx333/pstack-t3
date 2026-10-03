@@ -3,6 +3,8 @@
 
 import re
 import sys
+
+import yaml
 from pathlib import Path
 
 # Each pattern names a Cursor-only mechanism and its T3 replacement.
@@ -35,13 +37,20 @@ def check_tree(root):
         if not match:
             findings.append(f"{skill}/SKILL.md: missing frontmatter")
             continue
-        keys = dict(line.split(":", 1) for line in match.group(1).splitlines() if ":" in line and not line.startswith(" "))
+        try:
+            keys = yaml.safe_load(match.group(1))
+        except yaml.YAMLError as error:
+            findings.append(f"{skill}/SKILL.md: frontmatter is not valid YAML: {str(error).splitlines()[0]}")
+            continue
+        if not isinstance(keys, dict):
+            findings.append(f"{skill}/SKILL.md: frontmatter is not a mapping")
+            continue
         for key in FRONTMATTER_REQUIRED:
-            if key not in keys:
-                findings.append(f"{skill}/SKILL.md: frontmatter lacks {key}")
-        if keys.get("name", "").strip() != skill:
+            if not isinstance(keys.get(key), str) or not keys[key].strip():
+                findings.append(f"{skill}/SKILL.md: frontmatter lacks a string {key}")
+        if keys.get("name") != skill:
             findings.append(f"{skill}/SKILL.md: name must equal the directory name")
-        if len(keys.get("description", "")) > 1024:
+        if len(str(keys.get("description", ""))) > 1024:
             findings.append(f"{skill}/SKILL.md: description over 1024 characters")
     for file in sorted(root.rglob("*")):
         if not file.is_file() or file.suffix not in (".md", ".ts", ".mjs", ".sh", ".py", ".json", ".yaml", ".tsv"):

@@ -43,8 +43,8 @@ The budget caps the reasoning option (`effort`, `reasoningEffort`, or `reasoning
 
 - Code roles (`feature, refactoring`, `bug-fix`, `perf-issue`, `hillclimb`, `swarm workers`, `how explorer`, `why investigators`): the fastest strong coding model the user has.
 - Judgment roles (`judgment and prose`, `hardest tasks`, `how explainer`, `why synthesizer`, `reflect judgment, divergent, synthesizer`): the strongest reasoning model.
-- `reflect tooling`: a model from a different provider than the judgment model.
-- Panel roles (`arena runners`, `arena cross-judge pool`, `architect runners`, `interrogate reviewers`, `verifiers`): one seat per runnable provider, so diversity comes from different model families.
+- `reflect tooling`: a model from a different model family than the judgment model.
+- Panel roles (`arena runners`, `arena cross-judge pool`, `architect runners`, `interrogate reviewers`, `verifiers`): one seat per model family (Claude, GPT, Grok, Gemini, and so on), each on a runnable provider. One provider can serve several families, and two providers can serve the same one, so count families, not providers.
 
 Say which model you picked for each tier and why, in one line each. Marking a role `inherit` means it runs on whatever model the calling thread uses.
 

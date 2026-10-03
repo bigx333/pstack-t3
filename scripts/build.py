@@ -135,10 +135,23 @@ def build(destination, update_lock=False, skip_lock=False):
         findings = check_tree(staged)
         if findings:
             raise SystemExit("check failed:\n  " + "\n  ".join(findings))
-        if destination.exists():
-            shutil.rmtree(destination)
-        shutil.copytree(staged, destination)
+        replace_tree(staged, destination)
     return destination
+
+
+def replace_tree(source, destination):
+    """Swap destination for a full copy of source, keeping the old tree until the copy exists."""
+    incoming = destination.with_name(destination.name + ".incoming")
+    outgoing = destination.with_name(destination.name + ".outgoing")
+    for leftover in (incoming, outgoing):
+        if leftover.exists():
+            shutil.rmtree(leftover)
+    shutil.copytree(source, incoming)
+    if destination.exists():
+        destination.rename(outgoing)
+    incoming.rename(destination)
+    if outgoing.exists():
+        shutil.rmtree(outgoing)
 
 
 if __name__ == "__main__":

@@ -34,9 +34,11 @@ def main():
         commit = run("git", "rev-parse", "HEAD", cwd=checkout)
         source = checkout / meta["path"]
         plugin = json.loads((source / ".cursor-plugin/plugin.json").read_text())
-        vendor = ROOT / "vendor/pstack"
-        shutil.rmtree(vendor)
-        shutil.copytree(source, vendor)
+        sys.path.insert(0, str(ROOT / "scripts"))
+        from build import replace_tree
+
+        shutil.rmtree(source / ".git", ignore_errors=True)
+        replace_tree(source, ROOT / "vendor/pstack")
     previous = meta["commit"]
     meta.update(commit=commit, version=plugin.get("version", meta.get("version")))
     UPSTREAM.write_text(json.dumps(meta, indent=2) + "\n")
