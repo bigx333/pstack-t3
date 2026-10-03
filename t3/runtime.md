@@ -1,0 +1,220 @@
+---
+name: pstack-runtime
+description: How pstack-t3 skills delegate, pick models, isolate work, schedule, and verify inside T3 Code through the orchestrator V2 tools. Read before running any other pstack skill that spawns workers, picks a model, or schedules work.
+---
+
+# pstack-t3 runtime
+
+pstack-t3 runs inside T3 Code. Every provider T3 drives (Claude, Codex, Grok, Cursor, OpenCode, ACP agents) gets the same `t3-code` MCP server. This file maps each pstack concept onto those tools, so a skill works the same whatever model runs it.
+
+Tool names may carry a harness prefix, such as `mcp__t3-code__delegate_task` or `mcp__t3_code__delegate_task`. The semantics are the same. If the T3 tools do not appear in your first tool scan, make one direct call to `orchestrator_capabilities` before concluding they are missing. ACP agents that cannot see the tools use the terminal bridge in [ACP fallback](#acp-fallback).
+
+## Vocabulary
+
+| pstack says | In T3 |
+| --- | --- |
+| subagent, worker, delegate, reviewer, runner, judge | A child task created with `delegate_task`, owned by this thread. |
+| cloud worker | A child task. T3 children run on this machine, so they can reach local files, browsers, and auth. |
+| background, `run_in_background` | `delegate_task` with `mode: "async"`. |
+| wait for a worker | End the turn and let the completion notification wake you, or call `task_status` mid-turn. |
+| cancel a worker | `task_cancel`. |
+| model slug, role model | A target `{providerInstanceId, model, options}` from `orchestrator_capabilities`, resolved through roles. See [Roles](#roles). |
+| `inherit-parent`, `auto` | `"inherit"`. Omit `target` so the child inherits this thread's provider, model, and options. |
+| separate chat, coordinator chat, PR owner thread | A top-level thread from `t3_thread_launch`, only where [Top-level threads](#top-level-threads) allows it. |
+| worktree for a worker | A git worktree the child creates for itself, or a `t3_thread_launch` worktree binding for top-level threads. See [Isolation](#isolation). |
+| `/loop`, hourly tick, automation, scheduled wakeup | `schedule_task`. See [Scheduling](#scheduling). |
+| transcript, chat history, cloud-agent URL | A T3 thread, read with `t3_thread_search` and `t3_thread_read`. |
+| control-ui, browser MCP | T3 preview tools: `preview_open`, `preview_snapshot`, `preview_click`, `preview_type`, `preview_evaluate`, `preview_recording_start`. |
+| ask the user (`AskQuestion`) | The host's question tool if it has one, otherwise a short question in the reply. |
+| todolist | The host's todo tool if it has one, otherwise a checklist in the work log. |
+| PR you opened or now drive | Register it with `link_pull_request`. |
+
+## Delegation
+
+1. Call `orchestrator_capabilities` once per session before the first delegation, and again after a delegation fails on a target. It returns `providers[]`, each with `providerInstanceId`, `models[]` and their `options`, `canRunChildTask`, `canRunCrossProviderChildTask`, and `constraints`. Treat a provider with `canRunChildTask: false` as unavailable and report its `constraints` if a role needed it.
+2. Resolve the role's targets per [Roles](#roles).
+3. Spawn every independent child in one message:
+
+   ```json
+   {
+     "task": "<self-contained brief>",
+     "title": "<role>: <slice>",
+     "role": "review",
+     "mode": "async",
+     "target": {"providerInstanceId": "codex", "model": "gpt-6.1-sol", "options": {"reasoningEffort": "high"}},
+     "clientRequestId": "<skill>-<slug>-<seat>"
+   }
+   ```
+
+   - `role` is one of `implementation`, `research`, `review`, `design`, `test`, `general`.
+   - Omit `target` for an `inherit` seat.
+   - Use a stable `clientRequestId` so a retried call does not spawn a duplicate.
+   - Retain every returned `taskId` in your todo list or work log.
+4. A child starts with only its brief. It sees none of this conversation. Put the goal, the exact paths or SHAs, how to verify, and the report shape in the brief. Point at files instead of pasting large context.
+5. Collect results.
+   - If nothing else in this turn depends on the results, end the turn. Each completion wakes this thread.
+   - If you need a result now, call `task_status` with the `taskId`. `workState: "result_available"` means done, and `summary` holds the result. `working` and `waiting_for_children` mean not done. Do not busy-poll. Do other work between checks.
+   - `mode: "wait"` blocks for at most `timeoutMs`, ten minutes by default. Use it only for short children whose result gates the very next step. `waitTimedOut: true` does not cancel the child. Keep the `taskId`.
+6. You own every child's output. Read the diff or the evidence yourself before you report it. A child's "done" is a claim, not a verification.
+
+Same-provider native subagent tools (Claude's Agent tool, Codex's subagents) are fine for an `inherit` seat when they run the parent's model. Use `delegate_task` for every other seat, including same-provider seats on another model. Never substitute a top-level thread for a child task.
+
+### Permissions
+
+Children inherit this thread's runtime mode and interaction mode. Do not raise `runtimeMode` above the parent's. A read-only reviewer is a read-only brief: say "do not edit files, commit, or push" in the task. T3 has no read-only flag that keeps MCP access, so the brief carries the constraint.
+
+### Failure handling
+
+- A target is rejected: call `orchestrator_capabilities`, then fall back per [Roles](#roles), and say which seat changed and why.
+- A child fails or returns nothing usable: proceed with N-1 and record the dropout. Respawn once with a fresh child for a required slice. Never resume a failed child to fix its own work.
+- `task_status` shows `hasPendingChildRuns`: that child is still running nested work. It is not finished.
+
+### Fresh children by default
+
+Give new work to a fresh child with consolidated scope: the original brief, every later directive, and the prior child's report and branch. Message an existing child thread (`t3_thread_send`) only when the new work strictly needs state that lives with it, such as uncommitted changes in its worktree or a dev server it runs.
+
+## Roles
+
+Roles let one skill run on whatever providers the user has. A role value is a list of seats. Each seat is `"inherit"` or a target.
+
+### Where roles live
+
+1. `.pstack/t3-roles.json` in the project root. A role here replaces the same role from the user file.
+2. `~/.config/pstack-t3/roles.json`, or `$XDG_CONFIG_HOME/pstack-t3/roles.json`.
+3. Built-in defaults below.
+
+Print the merged roles for the current project with:
+
+```bash
+python3 <pstack-runtime>/scripts/roles.py show --cwd "$PWD"
+```
+
+`<pstack-runtime>` is the directory holding this file. Add `--role "<name>"` for one role. The output is small JSON with `source` per role.
+
+### Role names
+
+| Role | Seats | Used by |
+| --- | --- | --- |
+| `feature, refactoring` | 1 | Feature and Refactoring code delegates |
+| `bug-fix` | 1 | Bug fix code delegates |
+| `perf-issue` | 1 | Perf issue code delegates |
+| `hillclimb` | 1 | Hillclimb experiment delegates |
+| `judgment and prose` | 1 | Prose, judgment, briefs, synthesis |
+| `hardest tasks` | 1 | Cross-cutting design, concurrency, subtle algorithms |
+| `how explorer` | 1 | how |
+| `how explainer` | 1 | how |
+| `why investigators` | 1 | why, one seat model for every investigator |
+| `why synthesizer` | 1 | why |
+| `reflect tooling` | 1 | reflect |
+| `reflect judgment, divergent, synthesizer` | 1 | reflect |
+| `arena runners` | N | arena, one candidate per seat |
+| `arena cross-judge pool` | N | arena, pick one seat whose provider differs from the parent's |
+| `swarm workers` | 1 | swarm, default model for every worker |
+| `architect runners` | N | architect, one runner per seat |
+| `interrogate reviewers` | N | interrogate, one reviewer per seat |
+| `verifiers` | N | swarm-verify, autopilot, shipping, orchestrate verification |
+
+### Built-in defaults
+
+The defaults depend on nothing but the live catalog, so they never name a model the user lacks.
+
+- Single-seat roles default to `["inherit"]`.
+- Panel roles (`arena runners`, `arena cross-judge pool`, `architect runners`, `interrogate reviewers`, `verifiers`) default to one seat per provider whose `canRunChildTask` is true, using that provider's first listed model with its default options. The parent's own provider seat is `"inherit"`. With only one runnable provider, the panel is three `"inherit"` seats, and the report must say the models did not differ.
+
+### Budget
+
+The config may carry `"budget"`: `default`, `small`, `medium`, `large`, or `unlimited`. It caps the reasoning option of every seat that has one (`effort`, `reasoningEffort`, or `reasoning`) at `medium`, `high`, `xhigh`, or the highest non-special value. `default` leaves options alone. `ultracode` and `ultrathink` are never chosen by a budget. `roles.py show` reports the budgeted options.
+
+### Fallback
+
+When a seat's provider is not runnable or its model is not in the catalog:
+
+1. Use the same provider's first listed model.
+2. If the provider is not runnable, use `"inherit"`.
+3. Say which seat changed and why. Never silently drop a seat, because the seat count is the panel size.
+
+`roles.py validate --catalog <file>` checks a config against a saved catalog.
+
+## Isolation
+
+Two writers never share a checkout (principle-separate-before-serializing-shared-state).
+
+- Read-only children share the current checkout.
+- A writing child that may overlap with another writer gets its own git worktree. Name it in the brief: "Create a worktree with `git worktree add ../<repo>-<slug> -b <branch> <base>` and work only there. Report the path, branch, and head SHA." The parent removes the worktree after integrating it.
+- Long-lived owners that should appear in T3's sidebar with their own binding (PR owners in Autopilot and Orchestrate) are top-level threads launched with a worktree strategy. See below.
+- Uncommitted changes are not copied into new worktrees. Commit or stash first, or point the brief at a pushed branch.
+
+## Top-level threads
+
+Create top-level threads only when the user asked for separate threads or invoked a playbook that names them (Orchestrate, Autopilot-full, Autopilot-stack). Invoking those playbooks is that request. Everything else uses child tasks.
+
+```json
+{
+  "title": "PR owner: <slug>",
+  "workspaceStrategy": {"type": "worktree", "baseRef": "main", "branch": "pstack/<slug>", "startFromOrigin": false},
+  "message": "<brief>",
+  "modelSelection": {"instanceId": "codex", "model": "gpt-6.1-sol"}
+}
+```
+
+- For a stack, `baseRef` is the parent branch and `startFromOrigin` is false.
+- Omitted `workspaceStrategy` means the project root, not your worktree.
+- `t3_thread_launch` has no retry key. Retain the `threadId`. After an error or lost response, check `t3_thread_list` before retrying.
+- Follow a thread with `t3_thread_wait` and read it with `t3_thread_read` (use `afterPosition` to read only what is new). Send follow-ups with `t3_thread_send`, interrupt with `t3_thread_interrupt`.
+- `create_threads` makes up to 20 threads sharing this checkout. Use it only for read-only fan-out the user wants visible as threads.
+
+## Scheduling
+
+`schedule_task` creates recurring work in T3's scheduler. It runs even when no turn is active, so it replaces `/loop`, Cursor automations, and hourly ticks.
+
+```json
+{"title": "autopilot tick", "prompt": "<self-contained tick prompt>", "schedule": {"type": "interval", "everyMs": 3600000}, "clientRequestId": "<skill>-<slug>-tick"}
+```
+
+- Pass `schedule` as an object. `everyMs` is at least 60000. Wall-clock runs use `{"type": "fixed_time", "timeOfDay": "09:00", "weekdays": [1,2,3,4,5]}`.
+- Runs post into this thread by default. Set `bindToCurrentThread: false` only when each run should start a fresh thread.
+- The tick prompt must stand alone. Point it at the work log or store so a run can rebuild state from disk.
+- Report the returned cadence and `nextRunAt`. Delete the schedule with `delete_scheduled_task` when the done predicate holds. List with `list_scheduled_tasks`.
+- Do not schedule a tick to wait for a child task. Child completions already wake this thread.
+
+## Verification surfaces
+
+- Web or Electron UI: `preview_open` the dev server URL, then `preview_snapshot`, `preview_click`, `preview_type`, `preview_press`, `preview_wait_for`, `preview_evaluate`. Record proof with `preview_recording_start` and `preview_recording_stop`. Check `preview_status` first and close previews you opened with `t3_preview_close`.
+- Devices and simulators: `device_list`, `device_open`, `device_screenshot`, `device_close`.
+- CLIs and TUIs: run them in the terminal and assert on output.
+- A project `verify-*` skill beats all of these when one exists.
+
+## History
+
+- Find prior work: `t3_thread_search` with a topic, branch, or PR number. It covers the current project.
+- Read it: `t3_thread_read` with `view: "messages"` for the conversation, `view: "activity"` for tool activity. Page with `afterPosition`. Recover long items with `itemId` and `textOffset`.
+- A thread the user attached as context is readable even outside this project.
+- Child tasks are threads too. A `childThreadId` from `delegate_task` is readable with `t3_thread_read`.
+
+## Pull requests
+
+After you open a PR or start driving an existing one, call `link_pull_request` with its full URL. For a stack, link every layer. Before finishing PR work, call `list_thread_pull_requests` and link any missing PR. Report a link failure instead of claiming the PR is linked.
+
+## Pending requests
+
+A child or launched thread can stall on an approval or input request. `t3_pending_request_list` shows them and `t3_pending_request_read` shows one. Answer with `t3_pending_request_respond` only within the permissions the user already granted. Never approve a destructive action on a child's behalf.
+
+## ACP fallback
+
+Some ACP agents accept the injected MCP server but do not expose its tools. When the T3 tools are absent and `T3_ACP_MCP_NODE` is set, call the same tools through the terminal:
+
+```bash
+ELECTRON_RUN_AS_NODE=1 "$T3_ACP_MCP_NODE" ${T3_ACP_MCP_ENTRYPOINT:+"$T3_ACP_MCP_ENTRYPOINT"} acp-mcp-call orchestrator_capabilities '{}'
+ELECTRON_RUN_AS_NODE=1 "$T3_ACP_MCP_NODE" ${T3_ACP_MCP_ENTRYPOINT:+"$T3_ACP_MCP_ENTRYPOINT"} acp-mcp-call delegate_task '{"task":"...","mode":"async","clientRequestId":"..."}'
+```
+
+This is the supported transport, not a shell substitute for delegation.
+
+## Outside T3
+
+If neither the tools nor the ACP bridge exist, you are not running in T3. Use the host's native subagents on inherited models, run panels sequentially if needed, and state that model diversity and scheduling were unavailable.
+
+## Personas
+
+- `agents/poteto-agent.md` is the persona for code-writing delegates inside a poteto-mode playbook. Paste its body at the top of the child's brief.
+- `agents/comment-sicko.md` is the persona for the no-comments review. Paste its body at the top of that reviewer's brief.
