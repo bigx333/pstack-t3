@@ -35,7 +35,7 @@ This is an independent adaptation under the MIT license. It is not an official C
 Requires Python 3.10+, git, and T3 Code. Keep this checkout on disk, because the install links to it.
 
 ```bash
-git clone https://github.com/mgibson0708/pstack-t3.git ~/Projects/pstack-t3
+git clone https://github.com/creedants/pstack-t3.git ~/Projects/pstack-t3
 cd ~/Projects/pstack-t3
 python3 scripts/install.py            # user scope, every provider
 python3 scripts/install.py doctor     # confirm every provider sees pstack-t3
