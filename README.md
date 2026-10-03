@@ -26,6 +26,7 @@ This is an independent adaptation under the MIT license. It is not an official C
 | Cursor's built-in `create-skill` | `pstack-author-skill`, model-agnostic |
 | Worktree audit that scans Cursor chat storage on macOS | Git inventory on Linux and macOS, plus a check for T3 threads bound to each worktree |
 | — | `link_pull_request` on every PR a playbook opens or drives |
+| Different model per reviewer | Different model family per reviewer, compared by model and not by provider, because one provider can serve another's models |
 
 [`t3/runtime.md`](t3/runtime.md), installed as the `pstack-runtime` skill, holds every mapping in one place. The other skills link to it.
 
@@ -54,6 +55,10 @@ python3 scripts/install.py doctor     # confirm every provider sees pstack-t3
 - `--dry-run` prints the plan.
 
 Start a new T3 thread after installing so the provider rescans its skills.
+
+### User scope wins
+
+When the same skill name exists in both scopes, Claude and Grok load the user copy. Codex loaded the project copy in testing. A project install is therefore shadowed by any other pstack you have at user scope. Prefer the user install, and use `--replace` to move an older pstack aside. `python3 scripts/install.py doctor --project <repo>` reports shadowed names.
 
 ## Get started
 
@@ -104,6 +109,8 @@ python3 skills/pstack-runtime/scripts/roles.py show --role "interrogate reviewer
 - A seat whose provider is not runnable inherits the parent, and a model T3 dropped falls back to that provider's first model. Each fallback is reported, never silent.
 
 ## Develop
+
+The build check needs PyYAML (`pip install pyyaml`). Installing and `roles.py` need only the standard library.
 
 ```bash
 python3 scripts/build.py                     # regenerate skills/ from vendor/ + t3/
