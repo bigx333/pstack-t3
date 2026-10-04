@@ -18,7 +18,7 @@ python3 scripts/build.py
 python3 -m unittest discover -s tests -v
 ```
 
-Commit the regenerated `skills/` with your change. CI fails if `skills/` does not match what the build produces.
+Commit the regenerated `skills/` with your change. Add a line under Unreleased in `CHANGELOG.md` for any user-facing change. CI fails if `skills/` does not match what the build produces.
 
 If you changed a skill's behavior, run it in a real T3 thread and say in the PR which provider led and what it did.
 
@@ -29,3 +29,11 @@ python3 scripts/sync_upstream.py
 ```
 
 The build then lists each override whose upstream file changed. Re-port each one against the new upstream text, then run `python3 scripts/build.py --update-lock`.
+
+## Releasing
+
+1. Rename Unreleased in `CHANGELOG.md` to the new version.
+2. Commit, tag `vX.Y.Z`, and push the tag.
+3. Run `gh release create vX.Y.Z --notes-file <that changelog section>`.
+
+Cut a release after each upstream sync and any user-facing fix.

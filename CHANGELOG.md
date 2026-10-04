@@ -6,6 +6,8 @@
 - A README covering what pstack-t3 does, real run excerpts, a table of example prompts, a diagram, and an FAQ.
 - A [guide](docs/guide.md) to the first hour, a [how-it-works](docs/how-it-works.md) page, and a generated [skills catalog](docs/skills.md) that the build keeps in sync.
 - A banner and a social preview image in `docs/assets/`.
+- The README and guide state the requirement: a T3 Code nightly with Orchestrator V2 (`0.0.46-nightly.20261003.2610` or later).
+- A security policy, a pull request template, and Dependabot updates for GitHub Actions.
 
 ## 0.1.0
 
