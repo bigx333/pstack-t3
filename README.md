@@ -23,7 +23,7 @@ It's [Lauren Tan's pstack](https://github.com/cursor/plugins/tree/main/pstack), 
 
 ## What it does
 
-- **Picks the right workflow for your request.** `$poteto-mode` matches your task to one of 22 playbooks, such as bug fix, feature, refactor, perf, investigation, ship a PR stack, or run overnight. It follows the playbook's steps in a visible todo list.
+- **Picks the right workflow for your request.** `$poteto-mode` matches your task to one of 23 playbooks, such as bug fix, feature, refactor, perf, investigation, ship a PR stack, or run overnight. It follows the playbook's steps in a visible todo list.
 - **Makes different models check each other's work.** `$interrogate` sends your diff to reviewers on different model families at once. You get one verdict, with claims the lead has verified and agreement mapped across families.
 - **Runs work in parallel without collisions.** `$swarm` splits work across workers or races them. `$arena` runs several attempts and grafts the best parts into one. Workers that write get their own git worktree.
 - **Proves the change works.** It reproduces bugs on the real surface, including driving a web UI through T3's preview tools, and verifies against the real artifact rather than "it compiles".
@@ -70,7 +70,7 @@ $swarm audit stats.py: one read-only worker per public function.
 
 ## Quick start
 
-You need [T3 Code](https://t3.codes), git, and Python 3.10 or later.
+You need a [T3 Code nightly](https://github.com/pingdotgg/t3code/releases) with Orchestrator V2 (`0.0.46-nightly.20261003.2610` or later), git, and Python 3.10 or later. pstack-t3 runs on the orchestrator V2 tools (`delegate_task`, `t3_thread_launch`, `schedule_task`). Stable releases through `v0.0.45` don't ship them. Nightlies are the pre-releases on the T3 Code releases page.
 
 ```bash
 git clone https://github.com/creedants/pstack-t3.git ~/pstack-t3
