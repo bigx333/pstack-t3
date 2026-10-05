@@ -78,6 +78,9 @@ class LandingTest(unittest.TestCase):
     def origin_log(self):
         return sh("git", "log", "--format=%s", "main", cwd=self.base / "origin.git").splitlines()
 
+    def ref_exists(self, ref, cwd):
+        return subprocess.run(["git", "rev-parse", "--verify", "--quiet", ref], cwd=cwd, capture_output=True).returncode == 0
+
     def test_leases_refuse_overlap_including_aliases_and_the_whole_repo(self):
         self.init()
         self.assertEqual(self.land("lease", "claim", "--holder", "perf/D1", "--paths", "lib"), "L1")
@@ -227,10 +230,7 @@ elif args[:2] == ["pr", "merge"]:
     if (base / "merge-refused").exists():
         print("GraphQL: At least 1 approving review is required by reviewers with write access.", file=sys.stderr)
         sys.exit(1)
-    if (base / "checks").exists() and "--auto" not in args:
-        print("X Pull request #9 is not mergeable: the base branch policy prohibits the merge.", file=sys.stderr)
-        sys.exit(1)
-    if "--auto" in args:
+    if "--auto" in args and not (base / "auto-merges-immediately").exists():
         if not (base / "required-checks").exists():
             print("GraphQL: Pull request is in clean status (enablePullRequestAutoMerge)", file=sys.stderr)
             sys.exit(1)
@@ -240,6 +240,9 @@ elif args[:2] == ["pr", "merge"]:
                           capture_output=True, text=True).stdout.strip()
     (base / "pr-state").write_text(f"MERGED {{head}} 1111111111111111111111111111111111111111")
 elif args[:2] == ["pr", "view"] and "reviewDecision,statusCheckRollup" in args:
+    if (base / "checks-query-fails").exists():
+        print("API unavailable", file=sys.stderr)
+        sys.exit(1)
     review = "REVIEW_REQUIRED" if (base / "merge-refused").exists() else "APPROVED"
     checks = (base / "checks").read_text() if (base / "checks").exists() else ""
     pending = "1" if checks == "pending" else "0"
@@ -266,10 +269,13 @@ elif args[:2] == ["pr", "view"]:
             self.queue_one()
             self.assertEqual(self.land("land"), "opened PRs for Q1 (r/D1) https://github.com/o/r/pull/9")
             candidate = sh("git", "rev-parse", "landing/q1", cwd=self.base / "origin.git")
+            self.assertTrue(self.ref_exists("refs/remotes/origin/landing/q1", self.work))
             (self.base / "pr-state").write_text(f"OPEN {candidate} ")
             self.assertEqual(self.land("land"), "nothing to land")
             (self.base / "pr-state").write_text(f"MERGED {candidate} abc123")
             self.assertEqual(self.land("land"), "landed Q1 (r/D1)")
+            self.assertFalse(self.ref_exists("refs/heads/landing/q1", self.base / "origin.git"))
+            self.assertFalse(self.ref_exists("refs/remotes/origin/landing/q1", self.work))
             self.assertEqual(self.land("lease", "list"), "no leases held")
 
     def test_merge_mode_merges_its_own_pr_when_there_are_no_checks_to_wait_for(self):
@@ -279,6 +285,8 @@ elif args[:2] == ["pr", "view"]:
             self.assertEqual(self.land("land"), "landed Q1 (r/D1)")
             self.assertEqual((self.base / "merge-calls").read_text().splitlines(),
                              ["pr merge https://github.com/o/r/pull/9 --auto --merge", "pr merge https://github.com/o/r/pull/9 --merge"])
+            self.assertFalse(self.ref_exists("refs/heads/landing/q1", self.base / "origin.git"))
+            self.assertFalse(self.ref_exists("refs/remotes/origin/landing/q1", self.work))
             self.assertEqual(self.land("lease", "list"), "no leases held")
 
     def test_merge_mode_lets_github_merge_after_required_checks_and_asks_once(self):
@@ -300,10 +308,15 @@ elif args[:2] == ["pr", "view"]:
             self.queue_one()
             self.assertEqual(self.land("land"), "opened PRs that merge when their checks pass: Q1 (r/D1) https://github.com/o/r/pull/9")
             self.assertIn("waiting for required checks", self.land("status", "Q1"))
+            self.assertTrue(self.ref_exists("refs/heads/landing/q1", self.base / "origin.git"))
+            calls = (self.base / "merge-calls").read_text() if (self.base / "merge-calls").exists() else ""
+            self.assertNotIn("pr merge https://github.com/o/r/pull/9 --squash", calls)
             self.assertEqual(self.land("land"), "nothing to land")
             (self.base / "checks").unlink()
             self.assertEqual(self.land("land"), "landed Q1 (r/D1)")
             self.assertIn("pr merge https://github.com/o/r/pull/9 --squash", (self.base / "merge-calls").read_text())
+            self.assertFalse(self.ref_exists("refs/heads/landing/q1", self.base / "origin.git"))
+            self.assertFalse(self.ref_exists("refs/remotes/origin/landing/q1", self.work))
 
     def test_merge_mode_bounces_a_pr_whose_required_checks_failed(self):
         with self.fake_gh():
@@ -312,6 +325,60 @@ elif args[:2] == ["pr", "view"]:
             self.queue_one()
             self.assertEqual(self.land("land"), "bounced Q1 (r/D1): required checks failed on https://github.com/o/r/pull/9: test (3.12)")
             self.assertTrue(self.land("lease", "list").startswith("L1 active r/D1"))
+
+    def test_merge_mode_does_not_merge_when_auto_would_succeed_with_a_pending_check(self):
+        with self.fake_gh():
+            (self.base / "checks").write_text("pending")
+            (self.base / "auto-merges-immediately").write_text("")
+            self.init(mode="merge")
+            self.queue_one()
+            self.assertEqual(self.land("land"), "opened PRs that merge when their checks pass: Q1 (r/D1) https://github.com/o/r/pull/9")
+            self.assertIn("waiting for required checks", self.land("status", "Q1"))
+            self.assertTrue(self.land("lease", "list").startswith("L1 submitted"))
+            self.assertFalse((self.base / "merge-calls").exists())
+            self.assertTrue(self.ref_exists("refs/heads/landing/q1", self.base / "origin.git"))
+
+    def test_merge_mode_bounces_when_a_check_fails_after_auto_merge_was_enabled(self):
+        with self.fake_gh():
+            (self.base / "required-checks").write_text("")
+            self.init(mode="merge")
+            self.queue_one()
+            self.assertEqual(self.land("land"), "opened PRs that merge when their checks pass: Q1 (r/D1) https://github.com/o/r/pull/9")
+            self.assertIn("merge requested by the queue", self.land("status", "Q1"))
+            (self.base / "checks").write_text("failed")
+            self.assertEqual(self.land("land"), "bounced Q1 (r/D1): required checks failed on https://github.com/o/r/pull/9: test (3.12)")
+            self.assertTrue(self.land("lease", "list").startswith("L1 active r/D1"))
+            self.assertTrue(self.ref_exists("refs/heads/landing/q1", self.base / "origin.git"))
+
+    def test_merge_mode_does_not_merge_when_the_check_query_fails(self):
+        with self.fake_gh():
+            (self.base / "checks").write_text("pending")
+            (self.base / "checks-query-fails").write_text("")
+            self.init(mode="merge")
+            self.queue_one()
+            out = self.land("land")
+            self.assertIn("could not read checks", out)
+            self.assertIn("queue paused", out)
+            self.assertNotIn("landed Q1", out)
+            self.assertIn("awaiting-merge", self.land("status", "Q1"))
+            self.assertTrue(self.land("lease", "list").startswith("L1 submitted"))
+            self.assertFalse((self.base / "merge-calls").exists())
+
+    def test_a_checked_out_queue_branch_is_named_when_land_cannot_delete_it(self):
+        with self.fake_gh():
+            self.init(mode="human")
+            self.queue_one()
+            self.land("land")
+            candidate = sh("git", "rev-parse", "landing/q1", cwd=self.base / "origin.git")
+            sh("git", "branch", "landing/q1", candidate, cwd=self.work)
+            sh("git", "checkout", "-q", "landing/q1", cwd=self.work)
+            (self.base / "pr-state").write_text(f"MERGED {candidate} abc123")
+            out = self.land("land")
+            self.assertIn("landed Q1 (r/D1)", out)
+            self.assertIn("left local landing/q1", out)
+            self.assertTrue(self.ref_exists("refs/heads/landing/q1", self.work))
+            self.assertFalse(self.ref_exists("refs/heads/landing/q1", self.base / "origin.git"))
+            self.assertIn("Q1 landed", self.land("status", "Q1"))
 
     def test_merge_mode_pauses_when_github_requires_a_human_approval(self):
         with self.fake_gh():
@@ -474,16 +541,19 @@ elif args[:2] == ["pr", "view"]:
         governor.mkdir(parents=True)
         (governor / "governor.json").write_text(json.dumps({"slots": 2}))
         marks = self.base / "marks"
+        # land.py's slot gate reads LAND_SLOT. The queue sets it around this suite, so the
+        # subprocesses under test must not inherit it. The nested command still sets it itself.
+        env = {key: value for key, value in os.environ.items() if key != "LAND_SLOT"}
         worker = subprocess.Popen([sys.executable, str(SCRIPT), "slot", "--", "sh", "-c", f"echo worker-start >> {marks}; sleep 2; echo worker-end >> {marks}"],
-                                  env=os.environ.copy())
+                                  env=env)
         time.sleep(0.5)
         bench = subprocess.run([sys.executable, str(SCRIPT), "slot", "--exclusive", "--", "sh", "-c", f"echo bench >> {marks}"],
-                               capture_output=True, text=True, timeout=30, env=os.environ.copy())
+                               capture_output=True, text=True, timeout=30, env=env)
         worker.wait(timeout=30)
         self.assertEqual(bench.returncode, 0, bench.stderr)
         self.assertEqual(marks.read_text().split(), ["worker-start", "worker-end", "bench"])
         nested = subprocess.run([sys.executable, str(SCRIPT), "slot", "--", sys.executable, str(SCRIPT), "slot", "--exclusive", "--", "true"],
-                                capture_output=True, text=True, timeout=30, env=os.environ.copy())
+                                capture_output=True, text=True, timeout=30, env=env)
         self.assertNotEqual(nested.returncode, 0)
         self.assertIn("must be the outermost slot", nested.stderr)
 
