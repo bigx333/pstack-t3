@@ -176,10 +176,17 @@ exit 0
     def merged_queue_branch(self):
         """Save the queue head, then mark the PR merged at that head."""
         remote = self.base / "origin.git"
-        sha = sh("git", "rev-parse", "refs/heads/landing/q1", cwd=remote)
+        sha = sh("git", "rev-parse", "refs/heads/landing/e1", cwd=remote)
         (self.base / "pr-state").write_text(
             f"MERGED {sha} 1111111111111111111111111111111111111111")
         return sha
+
+    def test_status_accepts_the_old_q_number(self):
+        self.init()
+        self.assertEqual(self.queue_one(), "E1")
+        quoted = self.land("status", "Q1")
+        self.assertEqual(quoted, self.land("status", "E1"))
+        self.assertTrue(quoted.startswith("E1 queued"))
 
     def test_leases_refuse_overlap_including_aliases_and_the_whole_repo(self):
         self.init()
@@ -204,9 +211,9 @@ exit 0
         shas = [self.worker(f"w{n}", {f: f"{f} v{n}\n"}) for n, f in enumerate(["a.txt", "b.txt", "lib/x.py"], 1)]
         for n, (sha, path) in enumerate(zip(shas, ["a.txt", "b.txt", "lib"]), 1):
             self.land("lease", "claim", "--holder", f"r/D{n}", "--paths", path)
-            self.assertEqual(self.land("submit", "--holder", f"r/D{n}", "--branch", f"w{n}", "--sha", sha, "--lease", f"L{n}", "--reviewer", REVIEWER), f"Q{n}")
-        self.assertEqual(self.land("submit", "--holder", "r/D1", "--branch", "w1", "--sha", shas[0], "--lease", "L1", "--reviewer", REVIEWER), "Q1 already queued")
-        self.assertEqual(self.land("land"), "landed Q1 (r/D1), Q2 (r/D2), Q3 (r/D3)")
+            self.assertEqual(self.land("submit", "--holder", f"r/D{n}", "--branch", f"w{n}", "--sha", sha, "--lease", f"L{n}", "--reviewer", REVIEWER), f"E{n}")
+        self.assertEqual(self.land("submit", "--holder", "r/D1", "--branch", "w1", "--sha", shas[0], "--lease", "L1", "--reviewer", REVIEWER), "E1 already queued")
+        self.assertEqual(self.land("land"), "landed E1 (r/D1), E2 (r/D2), E3 (r/D3)")
         self.assertEqual(self.origin_log(), ["w3", "w2", "w1", "init"])
         self.assertEqual(self.land("lease", "list"), "no leases held")
 
@@ -219,8 +226,8 @@ exit 0
             self.land("lease", "claim", "--holder", f"r/D{n}", "--paths", path)
             self.land("submit", "--holder", f"r/D{n}", "--branch", f"w{n}", "--sha", sha, "--lease", f"L{n}", "--reviewer", REVIEWER)
         out = self.land("land")
-        self.assertIn("landed Q1 (r/D1), Q3 (r/D3)", out)
-        self.assertIn("bounced Q2 (r/D2): checks failed: `./check.sh` exited 1", out)
+        self.assertIn("landed E1 (r/D1), E3 (r/D3)", out)
+        self.assertIn("bounced E2 (r/D2): checks failed: `./check.sh` exited 1", out)
         self.assertEqual(self.origin_log(), ["w3", "w1", "init"])
         self.assertEqual(self.land("lease", "list").split(" until ")[0], "L2 active r/D2")
 
@@ -233,14 +240,14 @@ exit 0
         self.land("land")
         self.land("lease", "claim", "--holder", "r/D2", "--paths", "a.txt")
         self.land("submit", "--holder", "r/D2", "--branch", "w2", "--sha", second, "--lease", "L2", "--reviewer", REVIEWER)
-        self.assertEqual(self.land("land"), "bounced Q2 (r/D2): conflict with trunk")
+        self.assertEqual(self.land("land"), "bounced E2 (r/D2): conflict with trunk")
         path = self.base / "w2"
         sh("git", "fetch", "-q", "origin", cwd=path)
         sh("git", "reset", "-q", "--hard", "origin/main", cwd=path)
         (path / "a.txt").write_text("one\ntwo\n")
         fixed = self.commit("w2 fixed", cwd=path)
-        self.assertEqual(self.land("submit", "--holder", "r/D2", "--branch", "w2", "--sha", fixed, "--lease", "L2", "--reviewer", REVIEWER), "Q3")
-        self.assertEqual(self.land("land"), "landed Q3 (r/D2)")
+        self.assertEqual(self.land("submit", "--holder", "r/D2", "--branch", "w2", "--sha", fixed, "--lease", "L2", "--reviewer", REVIEWER), "E3")
+        self.assertEqual(self.land("land"), "landed E3 (r/D2)")
 
     def use_non_english_locale(self):
         """Set LANG and LC_ALL to de_DE.UTF-8 for the rest of this test.
@@ -309,7 +316,7 @@ exit 0
         self.land("land")
         self.land("lease", "claim", "--holder", "r/D2", "--paths", "a.txt")
         self.land("submit", "--holder", "r/D2", "--branch", "w2", "--sha", second, "--lease", "L2", "--reviewer", REVIEWER)
-        self.assertEqual(self.land("land"), "bounced Q2 (r/D2): conflict with trunk")
+        self.assertEqual(self.land("land"), "bounced E2 (r/D2): conflict with trunk")
         if not translated:
             recorded = self.git_locale_log.read_text().splitlines()
             self.assertTrue(recorded)
@@ -342,9 +349,9 @@ exit 0
         self.assertEqual(self.git_raw("status", "--porcelain", cwd=record).stdout, "")
         self.assertEqual(self.git_raw("ls-files", "-u", cwd=record).stdout, "")
         sh("git", "cherry-pick", "--abort", cwd=record)
-        self.assertEqual(self.land("land"), "bounced Q1 (r/D1): conflict with trunk")
-        status = self.land("status", "Q1")
-        self.assertIn("Q1 bounced", status)
+        self.assertEqual(self.land("land"), "bounced E1 (r/D1): conflict with trunk")
+        status = self.land("status", "E1")
+        self.assertIn("E1 bounced", status)
         self.assertIn("conflict with trunk", status)
         self.assertNotIn("already in trunk", status)
         self.assertEqual(self.land("lease", "list").split(" until ")[0], "L1 active r/D1")
@@ -370,7 +377,7 @@ exit 0
         sh("git", "push", "-q", "origin", "main", cwd=self.work)
         self.land("lease", "claim", "--holder", "r/D1", "--paths", "a.txt")
         self.land("submit", "--holder", "r/D1", "--branch", "w1", "--sha", sha, "--lease", "L1", "--reviewer", REVIEWER)
-        self.assertEqual(self.land("land"), "landed Q1 (r/D1)")
+        self.assertEqual(self.land("land"), "landed E1 (r/D1)")
         self.assertEqual(self.origin_log(), ["w1", "human", "init"])
         sh("git", "push", "-q", "--force", "origin", "HEAD~1:main", cwd=self.work)
         other = self.worker("w2", {"b.txt": "agent2\n"})
@@ -379,7 +386,7 @@ exit 0
         self.assertIn("queue paused: trunk no longer contains the last landed commit", self.land("land"))
         self.assertIn("queue paused", self.land("land"))
         self.land("resume")
-        self.assertEqual(self.land("land"), "landed Q2 (r/D2)")
+        self.assertEqual(self.land("land"), "landed E2 (r/D2)")
 
     def test_a_patch_already_on_trunk_lands_without_replaying_it(self):
         self.init()
@@ -389,9 +396,9 @@ exit 0
         sh("git", "push", "-q", "origin", "main", cwd=self.work)
         self.land("lease", "claim", "--holder", "r/D1", "--paths", "a.txt")
         self.land("submit", "--holder", "r/D1", "--branch", "w1", "--sha", sha, "--lease", "L1", "--reviewer", REVIEWER)
-        self.assertEqual(self.land("land"), "landed Q1 (r/D1)")
+        self.assertEqual(self.land("land"), "landed E1 (r/D1)")
         self.assertEqual(self.origin_log(), ["human", "init"])
-        self.assertIn("already in trunk", self.land("status", "Q1"))
+        self.assertIn("already in trunk", self.land("status", "E1"))
 
     def test_a_commit_that_started_empty_pauses_instead_of_landing(self):
         self.init()
@@ -423,10 +430,10 @@ exit 0
 
         with mock.patch.object(land, "publish", publish_then_crash), self.assertRaises(KeyboardInterrupt):
             land.land(store)
-        self.assertEqual(self.land("status", "Q1").split(" (")[0], "Q1 landing")
+        self.assertEqual(self.land("status", "E1").split(" (")[0], "E1 landing")
         self.assertEqual(self.land("land"), "nothing to land")
-        self.assertIn("Q1 landed", self.land("status", "Q1"))
-        self.assertIn("recovered after an interrupted run", self.land("status", "Q1"))
+        self.assertIn("E1 landed", self.land("status", "E1"))
+        self.assertIn("recovered after an interrupted run", self.land("status", "E1"))
         self.assertEqual(self.origin_log(), ["w1", "init"])
 
     def test_a_held_queue_lock_reports_busy(self):
@@ -443,7 +450,7 @@ exit 0
         self.land("lease", "claim", "--holder", "perf/D1", "--paths", "a.txt")
         self.land("submit", "--holder", "perf/D1", "--branch", "w1", "--sha", sha, "--lease", "L1", "--reviewer", REVIEWER)
         main_before = sh("git", "rev-parse", "main", cwd=self.work)
-        self.assertEqual(self.land("land"), "landed Q1 (perf/D1)")
+        self.assertEqual(self.land("land"), "landed E1 (perf/D1)")
         self.assertEqual(sh("git", "show", "refs/landing/perf:a.txt", cwd=self.work), "fast")
         self.assertEqual(sh("git", "rev-parse", "main", cwd=self.work), main_before)
         self.assertEqual(sh("git", "status", "--porcelain", cwd=self.work), "")
@@ -524,7 +531,7 @@ elif args[:2] == ["pr", "merge"]:
         print("X Pull request o/r#9 is not mergeable: the base branch policy prohibits the merge.", file=sys.stderr)
         sys.exit(1)
     import subprocess
-    head = subprocess.run(["git", "--git-dir", str(base / "origin.git"), "rev-parse", "refs/heads/landing/q1"],
+    head = subprocess.run(["git", "--git-dir", str(base / "origin.git"), "rev-parse", "refs/heads/landing/e1"],
                           capture_output=True, text=True).stdout.strip()
     (base / "pr-state").write_text(f"MERGED {{head}} 1111111111111111111111111111111111111111")
     if (base / "merge-state-lags").exists():
@@ -592,31 +599,205 @@ elif args[:2] == ["pr", "view"]:
         lease = self.land("lease", "claim", "--holder", holder, "--paths", path)
         return self.land("submit", "--holder", holder, "--branch", name, "--sha", sha, "--lease", lease, "--reviewer", REVIEWER)
 
+    def base_land_script(self):
+        """Pre-rename land.py. The fixture replaces git show, which fails in a shallow clone."""
+        path = self.base / "land-3678d11.py"
+        source = ROOT / "tests/fixtures/land_before_e_rename.py"
+        path.write_bytes(source.read_bytes())
+        return path
+
+    def use_land_script(self, path):
+        global SCRIPT
+        previous = SCRIPT
+        SCRIPT = path
+        return previous
+
+    def restore_land_script(self, previous):
+        global SCRIPT
+        SCRIPT = previous
+
+    def require_pr_head_on_origin(self):
+        """GitHub rejects pr create when the head branch is not on the remote."""
+        real = os.environ["LAND_GH"]
+        wrapper = self.base / "gh-head"
+        wrapper.write_text(
+            f"""#!{sys.executable}
+import os, subprocess, sys
+from pathlib import Path
+base = Path({str(self.base)!r})
+real = {real!r}
+args = sys.argv[1:]
+if args[:2] == ["pr", "create"]:
+    if (base / "pr-create-fails").exists():
+        print("gh: not authenticated", file=sys.stderr)
+        sys.exit(1)
+    head = args[args.index("--head") + 1]
+    present = subprocess.run(
+        ["git", "--git-dir", str(base / "origin.git"), "rev-parse", "--verify", "--quiet", "refs/heads/" + head],
+        capture_output=True).returncode == 0
+    if not present:
+        print("pull request create failed: GraphQL: Head ref must be a branch (createPullRequest)", file=sys.stderr)
+        sys.exit(1)
+os.execv(real, [real, *args])
+"""
+        )
+        wrapper.chmod(0o755)
+        os.environ["LAND_GH"] = str(wrapper)
+
+    def record_created_pr_branch(self):
+        """A PR is visible to `gh pr view` only for the head `pr create` used."""
+        real = os.environ["LAND_GH"]
+        wrapper = self.base / "gh-branch"
+        wrapper.write_text(
+            f"""#!{sys.executable}
+import os, sys
+from pathlib import Path
+base = Path({str(self.base)!r})
+args = sys.argv[1:]
+if args[:2] == ["pr", "create"] and "--head" in args:
+    (base / "pr-head").write_text(args[args.index("--head") + 1])
+if args[:2] == ["pr", "view"] and "url" in args and len(args) > 2 and args[2].startswith("landing/"):
+    recorded = (base / "pr-head").read_text() if (base / "pr-head").exists() else ""
+    if recorded != args[2]:
+        sys.exit(1)
+os.execv({real!r}, [{real!r}, *args])
+"""
+        )
+        wrapper.chmod(0o755)
+        os.environ["LAND_GH"] = str(wrapper)
+
+    def test_an_old_landing_q_branch_is_deleted_when_the_entry_lands(self):
+        with self.fake_gh():
+            self.init(mode="human")
+            self.queue_one()
+            self.land("land")
+            remote = self.base / "origin.git"
+            candidate = sh("git", "rev-parse", "refs/heads/landing/e1", cwd=remote)
+            sh("git", "update-ref", "refs/heads/landing/q1", candidate, cwd=remote)
+            sh("git", "update-ref", "-d", "refs/heads/landing/e1", cwd=remote)
+            (self.base / "pr-state").write_text(f"MERGED {candidate} abc123")
+            self.assertEqual(self.land("land"), "landed E1 (r/D1)")
+            self.assertFalse(self.ref_exists("refs/heads/landing/q1", remote))
+            self.assertFalse(self.ref_exists("refs/heads/landing/e1", remote))
+            self.assertFalse(self.ref_exists("refs/remotes/origin/landing/q1", self.work))
+
+    def test_a_merged_pr_on_landing_q_lands_when_the_remote_is_not_github(self):
+        with self.fake_gh():
+            sh("git", "remote", "set-url", "origin", str(self.base / "origin.git"), cwd=self.work)
+            previous = self.use_land_script(self.base_land_script())
+            try:
+                self.init(mode="human")
+                self.queue_one()
+                opened = self.land("land")
+                remote = self.base / "origin.git"
+                candidate = sh("git", "rev-parse", "refs/heads/landing/q1", cwd=remote)
+                (self.base / "pr-state").write_text(f"MERGED {candidate} abc123")
+                self.restore_land_script(previous)
+                previous = None
+                settled = self.land("land")
+            finally:
+                if previous is not None:
+                    self.restore_land_script(previous)
+            self.assertEqual(opened, "opened PRs for Q1 (r/D1) https://github.com/o/r/pull/9")
+            self.assertEqual(settled, "landed E1 (r/D1)")
+            self.assertFalse(self.ref_exists("refs/heads/landing/q1", remote))
+            self.assertIn("E1 landed", self.land("status", "E1"))
+            self.assertEqual(self.land("lease", "list"), "no leases held")
+
+    def test_a_legacy_push_without_a_pr_opens_the_pr_on_landing_e(self):
+        with self.fake_gh():
+            self.require_pr_head_on_origin()
+            previous = self.use_land_script(self.base_land_script())
+            try:
+                self.init(mode="human")
+                self.queue_one()
+                (self.base / "pr-create-fails").write_text("gh: not authenticated\n")
+                paused = self.land("land")
+                remote = self.base / "origin.git"
+                candidate = sh("git", "rev-parse", "refs/heads/landing/q1", cwd=remote)
+                self.assertFalse(self.ref_exists("refs/heads/landing/e1", remote))
+                (self.base / "pr-create-fails").unlink()
+                self.restore_land_script(previous)
+                previous = None
+                held = self.land("status", "Q1")
+                self.assertEqual(self.land("resume"), "queue resumed")
+                opened = self.land("land")
+            finally:
+                if previous is not None:
+                    self.restore_land_script(previous)
+            self.assertIn("queue paused", paused)
+            self.assertIn("awaiting-merge", held)
+            self.assertNotIn("pull/9", held)
+            self.assertNotIn("queue paused", opened)
+            self.assertTrue(self.ref_exists("refs/heads/landing/e1", remote), opened)
+            self.assertEqual(sh("git", "rev-parse", "refs/heads/landing/e1", cwd=remote), candidate)
+            status = self.land("status", "E1")
+            self.assertIn("awaiting-merge", status)
+            self.assertIn("https://github.com/o/r/pull/9", status)
+            self.assertNotIn("Paused", self.land("status"))
+
+    def adopt_pr_left_on_landing_q(self, mode):
+        """An older land.py opened the PR on landing/q<n> and died before storing the URL."""
+        with self.fake_gh():
+            self.record_created_pr_branch()
+            previous = self.use_land_script(self.base_land_script())
+            try:
+                self.init(mode=mode)
+                self.queue_one()
+                (self.base / "crash-on-create").write_text("")
+                crashed = subprocess.run(
+                    [sys.executable, str(SCRIPT), "--repo", str(self.work), "land"],
+                    capture_output=True, text=True, env=os.environ.copy())
+                self.assertEqual(crashed.returncode, -9, crashed.stdout + crashed.stderr)
+                self.restore_land_script(previous)
+                previous = None
+                opened = self.land("land")
+            finally:
+                if previous is not None:
+                    self.restore_land_script(previous)
+            calls = (self.base / "gh-calls").read_text().splitlines()
+            heads = [line.split("--head ", 1)[1].split(" ", 1)[0]
+                     for line in calls if line.startswith("pr create ")]
+            self.assertEqual(heads, ["landing/q1"], opened)
+            remote = self.base / "origin.git"
+            self.assertFalse(self.ref_exists("refs/heads/landing/e1", remote))
+            self.assertTrue(self.ref_exists("refs/heads/landing/q1", remote))
+            status = self.land("status", "E1")
+            self.assertTrue(
+                status.startswith("E1 awaiting-merge (r/D1, w1). https://github.com/o/r/pull/9"),
+                status)
+
+    def test_human_mode_adopts_the_pr_a_crashed_landing_q_create_left(self):
+        self.adopt_pr_left_on_landing_q("human")
+
+    def test_merge_mode_adopts_the_pr_a_crashed_landing_q_create_left(self):
+        self.adopt_pr_left_on_landing_q("merge")
+
     def test_human_mode_opens_a_pr_and_marks_landed_when_it_merges(self):
         with self.fake_gh():
             self.init(mode="human")
             self.queue_one()
-            self.assertEqual(self.land("land"), "opened PRs for Q1 (r/D1) https://github.com/o/r/pull/9")
-            candidate = sh("git", "rev-parse", "landing/q1", cwd=self.base / "origin.git")
-            self.assertTrue(self.ref_exists("refs/remotes/origin/landing/q1", self.work))
+            self.assertEqual(self.land("land"), "opened PRs for E1 (r/D1) https://github.com/o/r/pull/9")
+            candidate = sh("git", "rev-parse", "landing/e1", cwd=self.base / "origin.git")
+            self.assertTrue(self.ref_exists("refs/remotes/origin/landing/e1", self.work))
             (self.base / "pr-state").write_text(f"OPEN {candidate} ")
             self.assertEqual(self.land("land"), "nothing to land")
             (self.base / "pr-state").write_text(f"MERGED {candidate} abc123")
-            self.assertEqual(self.land("land"), "landed Q1 (r/D1)")
-            self.assertFalse(self.ref_exists("refs/heads/landing/q1", self.base / "origin.git"))
-            self.assertFalse(self.ref_exists("refs/remotes/origin/landing/q1", self.work))
+            self.assertEqual(self.land("land"), "landed E1 (r/D1)")
+            self.assertFalse(self.ref_exists("refs/heads/landing/e1", self.base / "origin.git"))
+            self.assertFalse(self.ref_exists("refs/remotes/origin/landing/e1", self.work))
             self.assertEqual(self.land("lease", "list"), "no leases held")
 
     def test_merge_mode_merges_its_own_pr_when_there_are_no_checks_to_wait_for(self):
         with self.fake_gh():
             self.init(mode="merge")
             self.queue_one()
-            self.assertIn("opened PRs that merge when their checks pass: Q1 (r/D1)", self.land("land"))
-            self.assertEqual(self.land("land"), "landed Q1 (r/D1)")
+            self.assertIn("opened PRs that merge when their checks pass: E1 (r/D1)", self.land("land"))
+            self.assertEqual(self.land("land"), "landed E1 (r/D1)")
             self.assertEqual((self.base / "merge-calls").read_text().splitlines(),
                              ["pr merge https://github.com/o/r/pull/9 --auto --merge", "pr merge https://github.com/o/r/pull/9 --merge"])
-            self.assertFalse(self.ref_exists("refs/heads/landing/q1", self.base / "origin.git"))
-            self.assertFalse(self.ref_exists("refs/remotes/origin/landing/q1", self.work))
+            self.assertFalse(self.ref_exists("refs/heads/landing/e1", self.base / "origin.git"))
+            self.assertFalse(self.ref_exists("refs/remotes/origin/landing/e1", self.work))
             self.assertEqual(self.land("lease", "list"), "no leases held")
 
     def test_merge_mode_lets_github_merge_after_required_checks_and_asks_once(self):
@@ -624,11 +805,11 @@ elif args[:2] == ["pr", "view"]:
             (self.base / "required-checks").write_text("")
             self.init(mode="merge")
             self.queue_one()
-            self.assertEqual(self.land("land"), "opened PRs that merge when their checks pass: Q1 (r/D1) https://github.com/o/r/pull/9")
+            self.assertEqual(self.land("land"), "opened PRs that merge when their checks pass: E1 (r/D1) https://github.com/o/r/pull/9")
             self.assertEqual(self.land("land"), "nothing to land")
-            candidate = sh("git", "rev-parse", "landing/q1", cwd=self.base / "origin.git")
+            candidate = sh("git", "rev-parse", "landing/e1", cwd=self.base / "origin.git")
             (self.base / "pr-state").write_text(f"MERGED {candidate} abc123")
-            self.assertEqual(self.land("land"), "landed Q1 (r/D1)")
+            self.assertEqual(self.land("land"), "landed E1 (r/D1)")
             self.assertEqual(len((self.base / "merge-calls").read_text().splitlines()), 1)
 
     def test_merge_mode_waits_for_running_checks_then_merges(self):
@@ -636,24 +817,24 @@ elif args[:2] == ["pr", "view"]:
             (self.base / "checks").write_text("pending")
             self.init(mode="merge", merge_method="squash")
             self.queue_one()
-            self.assertEqual(self.land("land"), "opened PRs that merge when their checks pass: Q1 (r/D1) https://github.com/o/r/pull/9")
-            self.assertIn("waiting for required checks", self.land("status", "Q1"))
-            self.assertTrue(self.ref_exists("refs/heads/landing/q1", self.base / "origin.git"))
+            self.assertEqual(self.land("land"), "opened PRs that merge when their checks pass: E1 (r/D1) https://github.com/o/r/pull/9")
+            self.assertIn("waiting for required checks", self.land("status", "E1"))
+            self.assertTrue(self.ref_exists("refs/heads/landing/e1", self.base / "origin.git"))
             calls = (self.base / "merge-calls").read_text() if (self.base / "merge-calls").exists() else ""
             self.assertNotIn("pr merge https://github.com/o/r/pull/9 --squash", calls)
             self.assertEqual(self.land("land"), "nothing to land")
             (self.base / "checks").write_text("passed")
-            self.assertEqual(self.land("land"), "landed Q1 (r/D1)")
+            self.assertEqual(self.land("land"), "landed E1 (r/D1)")
             self.assertIn("pr merge https://github.com/o/r/pull/9 --squash", (self.base / "merge-calls").read_text())
-            self.assertFalse(self.ref_exists("refs/heads/landing/q1", self.base / "origin.git"))
-            self.assertFalse(self.ref_exists("refs/remotes/origin/landing/q1", self.work))
+            self.assertFalse(self.ref_exists("refs/heads/landing/e1", self.base / "origin.git"))
+            self.assertFalse(self.ref_exists("refs/remotes/origin/landing/e1", self.work))
 
     def test_merge_mode_bounces_a_pr_whose_required_checks_failed(self):
         with self.fake_gh():
             (self.base / "checks").write_text("failed")
             self.init(mode="merge")
             self.queue_one()
-            self.assertEqual(self.land("land"), "bounced Q1 (r/D1): required checks failed on https://github.com/o/r/pull/9: test (3.12)")
+            self.assertEqual(self.land("land"), "bounced E1 (r/D1): required checks failed on https://github.com/o/r/pull/9: test (3.12)")
             self.assertTrue(self.land("lease", "list").startswith("L1 active r/D1"))
 
     def test_merge_mode_does_not_merge_when_auto_would_succeed_with_a_pending_check(self):
@@ -662,24 +843,24 @@ elif args[:2] == ["pr", "view"]:
             (self.base / "auto-merges-immediately").write_text("")
             self.init(mode="merge")
             self.queue_one()
-            self.assertEqual(self.land("land"), "opened PRs that merge when their checks pass: Q1 (r/D1) https://github.com/o/r/pull/9")
-            self.assertIn("waiting for required checks", self.land("status", "Q1"))
+            self.assertEqual(self.land("land"), "opened PRs that merge when their checks pass: E1 (r/D1) https://github.com/o/r/pull/9")
+            self.assertIn("waiting for required checks", self.land("status", "E1"))
             self.assertTrue(self.land("lease", "list").startswith("L1 submitted"))
             self.assertFalse((self.base / "merge-calls").exists())
-            self.assertTrue(self.ref_exists("refs/heads/landing/q1", self.base / "origin.git"))
+            self.assertTrue(self.ref_exists("refs/heads/landing/e1", self.base / "origin.git"))
 
     def test_merge_mode_bounces_when_a_check_fails_after_auto_merge_was_enabled(self):
         with self.fake_gh():
             (self.base / "required-checks").write_text("")
             self.init(mode="merge")
             self.queue_one()
-            self.assertEqual(self.land("land"), "opened PRs that merge when their checks pass: Q1 (r/D1) https://github.com/o/r/pull/9")
+            self.assertEqual(self.land("land"), "opened PRs that merge when their checks pass: E1 (r/D1) https://github.com/o/r/pull/9")
             self.assertEqual(self.land("land"), "nothing to land")
-            self.assertIn("merge requested by the queue", self.land("status", "Q1"))
+            self.assertIn("merge requested by the queue", self.land("status", "E1"))
             (self.base / "checks").write_text("failed")
-            self.assertEqual(self.land("land"), "bounced Q1 (r/D1): required checks failed on https://github.com/o/r/pull/9: test (3.12)")
+            self.assertEqual(self.land("land"), "bounced E1 (r/D1): required checks failed on https://github.com/o/r/pull/9: test (3.12)")
             self.assertTrue(self.land("lease", "list").startswith("L1 active r/D1"))
-            self.assertTrue(self.ref_exists("refs/heads/landing/q1", self.base / "origin.git"))
+            self.assertTrue(self.ref_exists("refs/heads/landing/e1", self.base / "origin.git"))
 
     def test_merge_mode_does_not_merge_when_the_check_query_fails(self):
         with self.fake_gh():
@@ -690,8 +871,8 @@ elif args[:2] == ["pr", "view"]:
             out = self.land("land")
             self.assertIn("could not read checks", out)
             self.assertIn("queue paused", out)
-            self.assertNotIn("landed Q1", out)
-            self.assertIn("awaiting-merge", self.land("status", "Q1"))
+            self.assertNotIn("landed E1", out)
+            self.assertIn("awaiting-merge", self.land("status", "E1"))
             self.assertTrue(self.land("lease", "list").startswith("L1 submitted"))
             self.assertFalse((self.base / "merge-calls").exists())
 
@@ -704,19 +885,19 @@ elif args[:2] == ["pr", "view"]:
             self.init(mode="merge")
             self.queue_one()
             opened = self.land("land")
-            self.assertIn("opened PRs that merge when their checks pass: Q1 (r/D1)", opened)
+            self.assertIn("opened PRs that merge when their checks pass: E1 (r/D1)", opened)
             self.assertNotIn("landed", opened)
             self.assertNotIn("queue paused", opened)
-            self.assertIn("waiting for required checks", self.land("status", "Q1"))
+            self.assertIn("waiting for required checks", self.land("status", "E1"))
             self.assertNotIn("Paused", self.land("status"))
             self.assertTrue(self.land("lease", "list").startswith("L1 submitted"))
-            self.assertTrue(self.ref_exists("refs/heads/landing/q1", self.base / "origin.git"))
+            self.assertTrue(self.ref_exists("refs/heads/landing/e1", self.base / "origin.git"))
             self.assertFalse((self.base / "merge-calls").exists())
-            self.assertEqual(self.land("land"), "landed Q1 (r/D1)")
+            self.assertEqual(self.land("land"), "landed E1 (r/D1)")
             self.assertEqual((self.base / "merge-calls").read_text().splitlines(),
                              ["pr merge https://github.com/o/r/pull/9 --auto --merge",
                               "pr merge https://github.com/o/r/pull/9 --merge"])
-            self.assertFalse(self.ref_exists("refs/heads/landing/q1", self.base / "origin.git"))
+            self.assertFalse(self.ref_exists("refs/heads/landing/e1", self.base / "origin.git"))
             self.assertEqual(self.land("lease", "list"), "no leases held")
 
     def test_merge_mode_lands_a_merged_pr_when_a_later_check_fails(self):
@@ -726,14 +907,14 @@ elif args[:2] == ["pr", "view"]:
             self.queue_one()
             self.land("land")
             self.assertEqual(self.land("land"), "nothing to land")
-            self.assertIn("merge requested by the queue", self.land("status", "Q1"))
-            candidate = sh("git", "rev-parse", "landing/q1", cwd=self.base / "origin.git")
+            self.assertIn("merge requested by the queue", self.land("status", "E1"))
+            candidate = sh("git", "rev-parse", "landing/e1", cwd=self.base / "origin.git")
             (self.base / "pr-state").write_text(f"MERGED {candidate} abc123")
             (self.base / "checks").write_text("failed")
-            self.assertEqual(self.land("land"), "landed Q1 (r/D1)")
-            self.assertFalse(self.ref_exists("refs/heads/landing/q1", self.base / "origin.git"))
+            self.assertEqual(self.land("land"), "landed E1 (r/D1)")
+            self.assertFalse(self.ref_exists("refs/heads/landing/e1", self.base / "origin.git"))
             self.assertEqual(self.land("lease", "list"), "no leases held")
-            self.assertIn("Q1 landed", self.land("status", "Q1"))
+            self.assertIn("E1 landed", self.land("status", "E1"))
 
     def test_merge_mode_pauses_on_a_merge_conflict_when_auto_merge_is_disabled(self):
         with self.fake_gh():
@@ -743,7 +924,7 @@ elif args[:2] == ["pr", "view"]:
             self.init(mode="merge")
             self.queue_one()
             opened = self.land("land")
-            self.assertIn("opened PRs that merge when their checks pass: Q1 (r/D1)", opened)
+            self.assertIn("opened PRs that merge when their checks pass: E1 (r/D1)", opened)
             self.assertNotIn("queue paused", opened)
             self.assertFalse((self.base / "merge-calls").exists())
             paused = self.land("land")
@@ -771,7 +952,7 @@ elif args[:2] == ["pr", "view"]:
             still = self.land("land")
             self.assertNotIn("queue paused", still)
             self.assertNotIn("landed", still)
-            self.assertIn("waiting for required checks", self.land("status", "Q1"))
+            self.assertIn("waiting for required checks", self.land("status", "E1"))
             self.assertNotIn("Paused", self.land("status"))
             calls = (self.base / "merge-calls").read_text()
             self.assertIn("pr merge https://github.com/o/r/pull/9 --auto --merge", calls)
@@ -779,7 +960,7 @@ elif args[:2] == ["pr", "view"]:
             (self.base / "pr-checks.json").unlink()
             (self.base / "auto-merge-disabled").unlink()
             (self.base / "checks").write_text("passed")
-            self.assertEqual(self.land("land"), "landed Q1 (r/D1)")
+            self.assertEqual(self.land("land"), "landed E1 (r/D1)")
 
     def test_merge_mode_waits_when_base_branch_policy_refuses_and_no_check_is_posted(self):
         with self.fake_gh():
@@ -792,10 +973,10 @@ elif args[:2] == ["pr", "view"]:
             still_empty = self.land("land")
             self.assertNotIn("queue paused", still_empty)
             self.assertNotIn("landed", still_empty)
-            self.assertIn("waiting for required checks", self.land("status", "Q1"))
+            self.assertIn("waiting for required checks", self.land("status", "E1"))
             (self.base / "pr-checks.json").unlink()
             (self.base / "checks").write_text("passed")
-            self.assertEqual(self.land("land"), "landed Q1 (r/D1)")
+            self.assertEqual(self.land("land"), "landed E1 (r/D1)")
 
     def test_merge_mode_does_not_merge_when_a_pending_check_appears_between_reads(self):
         with self.fake_gh():
@@ -807,7 +988,7 @@ elif args[:2] == ["pr", "view"]:
             self.assertNotIn("landed", opened)
             self.assertNotIn("queue paused", opened)
             self.assertFalse((self.base / "merge-calls").exists())
-            self.assertIn("waiting for required checks", self.land("status", "Q1"))
+            self.assertIn("waiting for required checks", self.land("status", "E1"))
             self.assertTrue(self.land("lease", "list").startswith("L1 submitted"))
 
     def test_merge_mode_does_not_merge_when_a_failed_check_appears_between_reads(self):
@@ -821,7 +1002,7 @@ elif args[:2] == ["pr", "view"]:
             self.assertNotIn("landed", opened)
             self.assertEqual((self.base / "merge-calls").read_text().strip(),
                              "pr merge https://github.com/o/r/pull/9 --disable-auto")
-            self.assertIn("bounced Q1 (r/D1): required checks failed on https://github.com/o/r/pull/9: test (3.12)", opened)
+            self.assertIn("bounced E1 (r/D1): required checks failed on https://github.com/o/r/pull/9: test (3.12)", opened)
             self.assertTrue(self.land("lease", "list").startswith("L1 active"))
 
     def test_merge_mode_drops_the_absent_marker_when_the_entry_lands(self):
@@ -830,9 +1011,9 @@ elif args[:2] == ["pr", "view"]:
             self.init(mode="merge")
             self.queue_one()
             opened = self.land("land")
-            self.assertIn("opened PRs that merge when their checks pass: Q1 (r/D1)", opened)
+            self.assertIn("opened PRs that merge when their checks pass: E1 (r/D1)", opened)
             self.assertEqual(self.absent_marker(), {"1": 1})
-            self.assertEqual(self.land("land"), "landed Q1 (r/D1)")
+            self.assertEqual(self.land("land"), "landed E1 (r/D1)")
             self.assertNotIn("1", self.absent_marker())
 
     def test_merge_mode_drops_the_absent_marker_when_the_entry_bounces(self):
@@ -844,7 +1025,7 @@ elif args[:2] == ["pr", "view"]:
             self.assertEqual(self.absent_marker(), {"1": 1})
             (self.base / "pr-checks.json").unlink()
             (self.base / "checks").write_text("failed")
-            self.assertIn("bounced Q1 (r/D1): required checks failed on https://github.com/o/r/pull/9: test (3.12)", self.land("land"))
+            self.assertIn("bounced E1 (r/D1): required checks failed on https://github.com/o/r/pull/9: test (3.12)", self.land("land"))
             self.assertNotIn("1", self.absent_marker())
             self.assertTrue(self.land("lease", "list").startswith("L1 active"))
 
@@ -853,16 +1034,16 @@ elif args[:2] == ["pr", "view"]:
             self.init(mode="human")
             self.queue_one()
             self.land("land")
-            candidate = sh("git", "rev-parse", "landing/q1", cwd=self.base / "origin.git")
-            sh("git", "branch", "landing/q1", candidate, cwd=self.work)
-            sh("git", "checkout", "-q", "landing/q1", cwd=self.work)
+            candidate = sh("git", "rev-parse", "landing/e1", cwd=self.base / "origin.git")
+            sh("git", "branch", "landing/e1", candidate, cwd=self.work)
+            sh("git", "checkout", "-q", "landing/e1", cwd=self.work)
             (self.base / "pr-state").write_text(f"MERGED {candidate} abc123")
             out = self.land("land")
-            self.assertIn("landed Q1 (r/D1)", out)
-            self.assertIn("left local landing/q1", out)
-            self.assertTrue(self.ref_exists("refs/heads/landing/q1", self.work))
-            self.assertFalse(self.ref_exists("refs/heads/landing/q1", self.base / "origin.git"))
-            self.assertIn("Q1 landed", self.land("status", "Q1"))
+            self.assertIn("landed E1 (r/D1)", out)
+            self.assertIn("left local landing/e1", out)
+            self.assertTrue(self.ref_exists("refs/heads/landing/e1", self.work))
+            self.assertFalse(self.ref_exists("refs/heads/landing/e1", self.base / "origin.git"))
+            self.assertIn("E1 landed", self.land("status", "E1"))
 
     def test_merge_mode_lands_when_the_remote_deletes_the_queue_branch_during_push(self):
         with self.fake_gh():
@@ -870,12 +1051,12 @@ elif args[:2] == ["pr", "view"]:
             self.init(mode="merge")
             self.queue_one()
             opened = self.land("land")
-            self.assertIn("opened PRs that merge when their checks pass: Q1 (r/D1)", opened)
-            self.assertEqual(self.land("land"), "landed Q1 (r/D1)")
-            self.assertIn("refs/heads/landing/q1", (self.base / "race-deleted").read_text())
+            self.assertIn("opened PRs that merge when their checks pass: E1 (r/D1)", opened)
+            self.assertEqual(self.land("land"), "landed E1 (r/D1)")
+            self.assertIn("refs/heads/landing/e1", (self.base / "race-deleted").read_text())
             self.assertEqual(self.land("lease", "list"), "no leases held")
-            self.assertFalse(self.ref_exists("refs/heads/landing/q1", self.base / "origin.git"))
-            self.assertFalse(self.ref_exists("refs/remotes/origin/landing/q1", self.work))
+            self.assertFalse(self.ref_exists("refs/heads/landing/e1", self.base / "origin.git"))
+            self.assertFalse(self.ref_exists("refs/remotes/origin/landing/e1", self.work))
             self.assertIn("branch-status 404", (self.base / "gh-calls").read_text())
 
     def test_merge_mode_leaves_the_entry_when_the_queue_branch_delete_fails(self):
@@ -885,12 +1066,12 @@ elif args[:2] == ["pr", "view"]:
             self.land("land")
             sh("git", "config", "receive.denyDeletes", "true", cwd=self.base / "origin.git")
             self.assertEqual(self.land("land"), "nothing to land")
-            self.assertIn("awaiting-merge", self.land("status", "Q1"))
-            self.assertIn("merge requested by the queue", self.land("status", "Q1"))
-            self.assertTrue(self.ref_exists("refs/heads/landing/q1", self.base / "origin.git"))
+            self.assertIn("awaiting-merge", self.land("status", "E1"))
+            self.assertIn("merge requested by the queue", self.land("status", "E1"))
+            self.assertTrue(self.ref_exists("refs/heads/landing/e1", self.base / "origin.git"))
             self.assertIn("branch-status 200", (self.base / "gh-calls").read_text())
             sh("git", "config", "--unset", "receive.denyDeletes", cwd=self.base / "origin.git")
-            self.assertEqual(self.land("land"), "landed Q1 (r/D1)")
+            self.assertEqual(self.land("land"), "landed E1 (r/D1)")
             self.assertEqual(self.land("lease", "list"), "no leases held")
 
     def test_merge_mode_leaves_the_entry_when_a_hidden_ref_refuses_deletion(self):
@@ -900,14 +1081,14 @@ elif args[:2] == ["pr", "view"]:
             self.land("land")
             remote = self.base / "origin.git"
             sh("git", "config", "receive.denyDeletes", "true", cwd=remote)
-            sh("git", "config", "uploadpack.hideRefs", "refs/heads/landing/q1", cwd=remote)
-            listed = subprocess.run(["git", "ls-remote", "origin", "refs/heads/landing/q1"],
+            sh("git", "config", "uploadpack.hideRefs", "refs/heads/landing/e1", cwd=remote)
+            listed = subprocess.run(["git", "ls-remote", "origin", "refs/heads/landing/e1"],
                                     cwd=self.work, capture_output=True, text=True)
             self.assertEqual((listed.returncode, listed.stdout.strip()), (0, ""))
             self.assertEqual(self.land("land"), "nothing to land")
-            self.assertTrue(self.ref_exists("refs/heads/landing/q1", remote))
+            self.assertTrue(self.ref_exists("refs/heads/landing/e1", remote))
             self.assertTrue(self.land("lease", "list").startswith("L1 submitted"))
-            self.assertIn("awaiting-merge", self.land("status", "Q1"))
+            self.assertIn("awaiting-merge", self.land("status", "E1"))
             self.assertIn("branch-status 200", (self.base / "gh-calls").read_text())
 
     def test_merge_mode_leaves_the_entry_when_a_hidden_ref_is_locked(self):
@@ -916,15 +1097,15 @@ elif args[:2] == ["pr", "view"]:
             self.queue_one()
             self.land("land")
             remote = self.base / "origin.git"
-            sh("git", "config", "uploadpack.hideRefs", "refs/heads/landing/q1", cwd=remote)
-            (remote / "refs/heads/landing/q1.lock").write_text("x")
-            listed = subprocess.run(["git", "ls-remote", "origin", "refs/heads/landing/q1"],
+            sh("git", "config", "uploadpack.hideRefs", "refs/heads/landing/e1", cwd=remote)
+            (remote / "refs/heads/landing/e1.lock").write_text("x")
+            listed = subprocess.run(["git", "ls-remote", "origin", "refs/heads/landing/e1"],
                                     cwd=self.work, capture_output=True, text=True)
             self.assertEqual((listed.returncode, listed.stdout.strip()), (0, ""))
             self.assertEqual(self.land("land"), "nothing to land")
-            self.assertTrue(self.ref_exists("refs/heads/landing/q1", remote))
+            self.assertTrue(self.ref_exists("refs/heads/landing/e1", remote))
             self.assertTrue(self.land("lease", "list").startswith("L1 submitted"))
-            self.assertIn("awaiting-merge", self.land("status", "Q1"))
+            self.assertIn("awaiting-merge", self.land("status", "E1"))
             self.assertIn("branch-status 200", (self.base / "gh-calls").read_text())
 
     def test_merge_mode_leaves_the_entry_when_receive_pack_hides_the_queue_branch(self):
@@ -933,11 +1114,11 @@ elif args[:2] == ["pr", "view"]:
             self.queue_one()
             self.land("land")
             remote = self.base / "origin.git"
-            sh("git", "config", "receive.hideRefs", "refs/heads/landing/q1", cwd=remote)
+            sh("git", "config", "receive.hideRefs", "refs/heads/landing/e1", cwd=remote)
             self.assertEqual(self.land("land"), "nothing to land")
-            self.assertTrue(self.ref_exists("refs/heads/landing/q1", remote))
+            self.assertTrue(self.ref_exists("refs/heads/landing/e1", remote))
             self.assertTrue(self.land("lease", "list").startswith("L1 submitted"))
-            self.assertIn("awaiting-merge", self.land("status", "Q1"))
+            self.assertIn("awaiting-merge", self.land("status", "E1"))
             self.assertIn("branch-status 200", (self.base / "gh-calls").read_text())
 
     def test_an_annotated_tag_stays_local_when_the_queue_pushes(self):
@@ -948,9 +1129,9 @@ elif args[:2] == ["pr", "view"]:
             sh("git", "config", "push.followTags", "true", cwd=self.work)
             log = self.record_pushes()
             try:
-                self.assertIn("opened PRs that merge when their checks pass: Q1 (r/D1)", self.land("land"))
+                self.assertIn("opened PRs that merge when their checks pass: E1 (r/D1)", self.land("land"))
                 self.merged_queue_branch()
-                self.assertEqual(self.land("land"), "landed Q1 (r/D1)")
+                self.assertEqual(self.land("land"), "landed E1 (r/D1)")
             finally:
                 self.stop_recording_pushes()
             remote = self.base / "origin.git"
@@ -966,7 +1147,7 @@ elif args[:2] == ["pr", "view"]:
         sh("git", "config", "push.followTags", "true", cwd=self.work)
         log = self.record_pushes()
         try:
-            self.assertEqual(self.land("land"), "landed Q1 (r/D1)")
+            self.assertEqual(self.land("land"), "landed E1 (r/D1)")
         finally:
             self.stop_recording_pushes()
         self.assert_pushes_stay_on_their_refs(log)
@@ -979,21 +1160,22 @@ elif args[:2] == ["pr", "view"]:
             self.land("land")
             remote = self.base / "origin.git"
             self.merged_queue_branch()
-            sh("git", "update-ref", "-d", "refs/heads/landing/q1", cwd=remote)
+            sh("git", "update-ref", "-d", "refs/heads/landing/e1", cwd=remote)
             sh("git", "tag", "-a", "private-local-tag", "-m", "local tag", cwd=self.work)
             sh("git", "config", "push.followTags", "true", cwd=self.work)
             log = self.record_pushes()
             try:
-                self.assertEqual(self.land("land"), "landed Q1 (r/D1)")
+                self.assertEqual(self.land("land"), "landed E1 (r/D1)")
             finally:
                 self.stop_recording_pushes()
             self.assertEqual(
                 log.read_text().splitlines(),
-                ["push --no-follow-tags origin --delete landing/q1"])
+                ["push --no-follow-tags origin --delete landing/e1",
+                 "push --no-follow-tags origin --delete landing/q1"])
             self.assertFalse(self.ref_exists("refs/tags/private-local-tag", remote))
             self.assertIn("branch-status 404", (self.base / "gh-calls").read_text())
             self.assertIn(
-                "api --include repos/{owner}/{repo}/branches/landing/q1",
+                "api --include repos/{owner}/{repo}/branches/landing/e1",
                 (self.base / "gh-calls").read_text())
             self.assertEqual(self.land("lease", "list"), "no leases held")
 
@@ -1004,13 +1186,13 @@ elif args[:2] == ["pr", "view"]:
             self.land("land")
             remote = self.base / "origin.git"
             self.merged_queue_branch()
-            sh("git", "update-ref", "-d", "refs/heads/landing/q1", cwd=remote)
+            sh("git", "update-ref", "-d", "refs/heads/landing/e1", cwd=remote)
             (self.base / "branch-query-fails").write_text("x")
             self.assertEqual(self.land("land"), "nothing to land")
             self.assertIn("branch-status 500", (self.base / "gh-calls").read_text())
-            self.assertIn("awaiting-merge", self.land("status", "Q1"))
+            self.assertIn("awaiting-merge", self.land("status", "E1"))
             self.assertTrue(self.land("lease", "list").startswith("L1 submitted"))
-            self.assertFalse(self.ref_exists("refs/heads/landing/q1", remote))
+            self.assertFalse(self.ref_exists("refs/heads/landing/e1", remote))
 
     def test_merge_mode_leaves_the_entry_when_another_push_url_dropped_the_branch(self):
         with self.fake_gh():
@@ -1019,12 +1201,12 @@ elif args[:2] == ["pr", "view"]:
             self.land("land")
             remote = self.base / "origin.git"
             backup = self.base / "backup.git"
-            ref = "refs/heads/landing/q1"
+            ref = "refs/heads/landing/e1"
             sha = self.merged_queue_branch()
             sh("git", "checkout", "--detach", "-q", sha, cwd=self.work)
             sh("git", "clone", "--bare", "-q", str(remote), str(backup), cwd=self.base)
             sh("git", "update-ref", "-d", ref, cwd=backup)
-            (remote / "refs/heads/landing/q1.lock").write_text("x")
+            (remote / "refs/heads/landing/e1.lock").write_text("x")
             sh("git", "config", "--add", "remote.origin.pushurl", str(remote), cwd=self.work)
             sh("git", "config", "--add", "remote.origin.pushurl", str(backup), cwd=self.work)
             self.assertEqual(self.land("land"), "nothing to land")
@@ -1032,7 +1214,7 @@ elif args[:2] == ["pr", "view"]:
             self.assertFalse(self.ref_exists(ref, backup))
             self.assertNotIn("branches/", (self.base / "gh-calls").read_text())
             self.assertTrue(self.land("lease", "list").startswith("L1 submitted"))
-            self.assertIn("awaiting-merge", self.land("status", "Q1"))
+            self.assertIn("awaiting-merge", self.land("status", "E1"))
 
     def test_merge_mode_leaves_the_entry_when_the_other_push_url_keeps_the_branch(self):
         with self.fake_gh():
@@ -1041,12 +1223,12 @@ elif args[:2] == ["pr", "view"]:
             self.land("land")
             origin = self.base / "origin.git"
             backup = self.base / "backup.git"
-            ref = "refs/heads/landing/q1"
+            ref = "refs/heads/landing/e1"
             sha = self.merged_queue_branch()
             sh("git", "checkout", "--detach", "-q", sha, cwd=self.work)
             sh("git", "clone", "--bare", "-q", str(origin), str(backup), cwd=self.base)
             sh("git", "update-ref", "-d", ref, cwd=origin)
-            lock = backup / "refs/heads/landing/q1.lock"
+            lock = backup / "refs/heads/landing/e1.lock"
             lock.parent.mkdir(parents=True, exist_ok=True)
             lock.write_text("x")
             sh("git", "config", "--add", "remote.origin.pushurl", str(origin), cwd=self.work)
@@ -1055,7 +1237,7 @@ elif args[:2] == ["pr", "view"]:
             self.assertFalse(self.ref_exists(ref, origin))
             self.assertTrue(self.ref_exists(ref, backup))
             self.assertTrue(self.land("lease", "list").startswith("L1 submitted"))
-            self.assertIn("awaiting-merge", self.land("status", "Q1"))
+            self.assertIn("awaiting-merge", self.land("status", "E1"))
 
     def test_merge_mode_leaves_the_entry_when_the_push_url_names_another_repo(self):
         with self.fake_gh():
@@ -1068,9 +1250,9 @@ elif args[:2] == ["pr", "view"]:
             sh("git", "config", "receive.denyDeletes", "true", cwd=remote)
             (self.base / "forge-says-missing").write_text("x")
             self.assertEqual(self.land("land"), "nothing to land")
-            self.assertTrue(self.ref_exists("refs/heads/landing/q1", remote))
+            self.assertTrue(self.ref_exists("refs/heads/landing/e1", remote))
             self.assertTrue(self.land("lease", "list").startswith("L1 submitted"))
-            self.assertIn("awaiting-merge", self.land("status", "Q1"))
+            self.assertIn("awaiting-merge", self.land("status", "E1"))
             self.assertNotIn("branches/", (self.base / "gh-calls").read_text())
 
     def test_merge_mode_leaves_the_entry_when_the_forge_repo_cannot_be_read(self):
@@ -1080,12 +1262,12 @@ elif args[:2] == ["pr", "view"]:
             self.land("land")
             remote = self.base / "origin.git"
             self.merged_queue_branch()
-            sh("git", "update-ref", "-d", "refs/heads/landing/q1", cwd=remote)
+            sh("git", "update-ref", "-d", "refs/heads/landing/e1", cwd=remote)
             (self.base / "repo-view-fails").write_text("x")
             self.assertEqual(self.land("land"), "nothing to land")
-            self.assertFalse(self.ref_exists("refs/heads/landing/q1", remote))
+            self.assertFalse(self.ref_exists("refs/heads/landing/e1", remote))
             self.assertTrue(self.land("lease", "list").startswith("L1 submitted"))
-            self.assertIn("awaiting-merge", self.land("status", "Q1"))
+            self.assertIn("awaiting-merge", self.land("status", "E1"))
 
     def test_push_mode_settles_a_missing_branch_only_from_gits_absent_line(self):
         with self.fake_gh():
@@ -1099,7 +1281,7 @@ elif args[:2] == ["pr", "view"]:
             self.assertEqual(store.contract["mode"], "push")
             remote = self.base / "origin.git"
             self.merged_queue_branch()
-            sh("git", "update-ref", "-d", "refs/heads/landing/q1", cwd=remote)
+            sh("git", "update-ref", "-d", "refs/heads/landing/e1", cwd=remote)
             sh("git", "tag", "-a", "private-local-tag", "-m", "local tag", cwd=self.work)
             sh("git", "config", "push.followTags", "true", cwd=self.work)
             (self.base / "branch-query-fails").write_text("x")
@@ -1114,10 +1296,11 @@ elif args[:2] == ["pr", "view"]:
             self.assertEqual(bounced, [])
             self.assertEqual(
                 log.read_text().splitlines(),
-                ["push --no-follow-tags origin --delete landing/q1"])
+                ["push --no-follow-tags origin --delete landing/e1",
+                 "push --no-follow-tags origin --delete landing/q1"])
             self.assertNotIn("branches/", (self.base / "gh-calls").read_text())
             self.assertFalse(self.ref_exists("refs/tags/private-local-tag", remote))
-            self.assertEqual(self.land("status", "Q1").splitlines()[0].split(". ")[0], "Q1 landed (r/D1, w1)")
+            self.assertEqual(self.land("status", "E1").splitlines()[0].split(". ")[0], "E1 landed (r/D1, w1)")
             self.assertEqual(self.land("lease", "list"), "no leases held")
 
     def test_merge_mode_lands_in_the_run_whose_plain_merge_succeeds(self):
@@ -1127,12 +1310,12 @@ elif args[:2] == ["pr", "view"]:
             self.init(mode="merge", merge_method="squash")
             self.queue_one()
             opened = self.land("land")
-            self.assertIn("opened PRs that merge when their checks pass: Q1 (r/D1)", opened)
+            self.assertIn("opened PRs that merge when their checks pass: E1 (r/D1)", opened)
             self.assertNotIn("landed", opened)
-            self.assertEqual(self.land("land"), "landed Q1 (r/D1)")
+            self.assertEqual(self.land("land"), "landed E1 (r/D1)")
             self.assertEqual(self.land("lease", "list"), "no leases held")
-            self.assertFalse(self.ref_exists("refs/heads/landing/q1", self.base / "origin.git"))
-            self.assertFalse(self.ref_exists("refs/remotes/origin/landing/q1", self.work))
+            self.assertFalse(self.ref_exists("refs/heads/landing/e1", self.base / "origin.git"))
+            self.assertFalse(self.ref_exists("refs/remotes/origin/landing/e1", self.work))
             self.assertIn("pr merge https://github.com/o/r/pull/9 --squash", (self.base / "merge-calls").read_text())
 
     def test_merge_mode_lands_in_the_run_whose_auto_merge_completes(self):
@@ -1145,9 +1328,9 @@ elif args[:2] == ["pr", "view"]:
             (self.base / "merge-state-lags").write_text("")
             (self.base / "pr-checks.json").unlink()
             (self.base / "checks").write_text("passed")
-            self.assertEqual(self.land("land"), "landed Q1 (r/D1)")
+            self.assertEqual(self.land("land"), "landed E1 (r/D1)")
             self.assertEqual(self.land("lease", "list"), "no leases held")
-            self.assertFalse(self.ref_exists("refs/heads/landing/q1", self.base / "origin.git"))
+            self.assertFalse(self.ref_exists("refs/heads/landing/e1", self.base / "origin.git"))
             calls = (self.base / "merge-calls").read_text().splitlines()
             self.assertEqual(calls[-1], "pr merge https://github.com/o/r/pull/9 --auto --squash")
 
@@ -1156,16 +1339,16 @@ elif args[:2] == ["pr", "view"]:
             (self.base / "required-checks").write_text("")
             self.init(mode="merge")
             self.queue_one()
-            self.assertIn("opened PRs that merge when their checks pass: Q1 (r/D1)", self.land("land"))
+            self.assertIn("opened PRs that merge when their checks pass: E1 (r/D1)", self.land("land"))
             self.assertEqual(self.land("land"), "nothing to land")
-            self.assertIn("merge requested by the queue", self.land("status", "Q1"))
-            candidate = sh("git", "rev-parse", "landing/q1", cwd=self.base / "origin.git")
+            self.assertIn("merge requested by the queue", self.land("status", "E1"))
+            candidate = sh("git", "rev-parse", "landing/e1", cwd=self.base / "origin.git")
             (self.base / "pr-state").write_text(f"OPEN {candidate} ")
             (self.base / "pr-state-after").write_text(f"MERGED {candidate} abc123")
             (self.base / "checks").write_text("passed")
-            self.assertEqual(self.land("land"), "landed Q1 (r/D1)")
+            self.assertEqual(self.land("land"), "landed E1 (r/D1)")
             self.assertEqual(self.land("lease", "list"), "no leases held")
-            self.assertFalse(self.ref_exists("refs/heads/landing/q1", self.base / "origin.git"))
+            self.assertFalse(self.ref_exists("refs/heads/landing/e1", self.base / "origin.git"))
 
     def test_merge_mode_pauses_for_review_without_calling_auto_merge(self):
         with self.fake_gh():
@@ -1182,7 +1365,7 @@ elif args[:2] == ["pr", "view"]:
             self.assertNotIn("landed", out)
             calls = (self.base / "merge-calls").read_text() if (self.base / "merge-calls").exists() else ""
             self.assertNotIn("--auto", calls.split())
-            self.assertIn("awaiting-merge", self.land("status", "Q1"))
+            self.assertIn("awaiting-merge", self.land("status", "E1"))
             self.assertTrue(self.land("lease", "list").startswith("L1 submitted"))
 
     def test_merge_mode_pauses_when_changes_are_requested_without_calling_auto_merge(self):
@@ -1207,15 +1390,15 @@ elif args[:2] == ["pr", "view"]:
             self.queue_one()
             self.land("land")
             self.assertEqual(self.land("land"), "nothing to land")
-            self.assertIn("merge requested by the queue", self.land("status", "Q1"))
+            self.assertIn("merge requested by the queue", self.land("status", "E1"))
             (self.base / "checks").write_text("failed")
             out = self.land("land")
-            self.assertIn("bounced Q1 (r/D1): required checks failed on https://github.com/o/r/pull/9: test (3.12)", out)
+            self.assertIn("bounced E1 (r/D1): required checks failed on https://github.com/o/r/pull/9: test (3.12)", out)
             self.assertIn("pr merge https://github.com/o/r/pull/9 --disable-auto", (self.base / "merge-calls").read_text())
             self.assertNotIn("pr comment", (self.base / "gh-calls").read_text())
             self.assertNotIn("pr close", (self.base / "gh-calls").read_text())
             self.assertTrue(self.land("lease", "list").startswith("L1 active r/D1"))
-            self.assertTrue(self.ref_exists("refs/heads/landing/q1", self.base / "origin.git"))
+            self.assertTrue(self.ref_exists("refs/heads/landing/e1", self.base / "origin.git"))
 
     def test_merge_mode_reports_a_failure_to_disable_auto_merge_on_bounce(self):
         with self.fake_gh():
@@ -1228,7 +1411,7 @@ elif args[:2] == ["pr", "view"]:
             self.land("land")
             (self.base / "checks").write_text("failed")
             out = self.land("land")
-            self.assertIn("bounced Q1 (r/D1): required checks failed on https://github.com/o/r/pull/9: test (3.12)", out)
+            self.assertIn("bounced E1 (r/D1): required checks failed on https://github.com/o/r/pull/9: test (3.12)", out)
             self.assertIn("auto-merge still enabled: API unavailable", out)
             self.assertNotIn("pr close", (self.base / "gh-calls").read_text())
             self.assertTrue(self.land("lease", "list").startswith("L1 active"))
@@ -1239,11 +1422,11 @@ elif args[:2] == ["pr", "view"]:
             (self.base / "auto-merge-request.json").write_text("null")
             self.init(mode="merge")
             self.queue_one()
-            self.assertEqual(self.land("land"), "bounced Q1 (r/D1): required checks failed on https://github.com/o/r/pull/9: test (3.12)")
+            self.assertEqual(self.land("land"), "bounced E1 (r/D1): required checks failed on https://github.com/o/r/pull/9: test (3.12)")
             calls = (self.base / "merge-calls").read_text() if (self.base / "merge-calls").exists() else ""
             self.assertNotIn("--disable-auto", calls)
             self.assertNotIn("pr close", (self.base / "gh-calls").read_text())
-            self.assertNotIn("auto-merge still enabled", self.land("status", "Q1"))
+            self.assertNotIn("auto-merge still enabled", self.land("status", "E1"))
             self.assertTrue(self.land("lease", "list").startswith("L1 active"))
 
     def test_merge_mode_reports_disable_auto_failure_when_auto_merge_request_is_set(self):
@@ -1257,7 +1440,7 @@ elif args[:2] == ["pr", "view"]:
             self.land("land")
             (self.base / "checks").write_text("failed")
             out = self.land("land")
-            self.assertIn("bounced Q1 (r/D1): required checks failed on https://github.com/o/r/pull/9: test (3.12)", out)
+            self.assertIn("bounced E1 (r/D1): required checks failed on https://github.com/o/r/pull/9: test (3.12)", out)
             self.assertIn("auto-merge still enabled: GraphQL: Auto merge is not enabled for this pull request", out)
             self.assertIn("pr merge https://github.com/o/r/pull/9 --disable-auto", (self.base / "merge-calls").read_text())
             self.assertNotIn("pr close", (self.base / "gh-calls").read_text())
@@ -1278,7 +1461,7 @@ elif args[:2] == ["pr", "view"]:
             self.queue_one()
             self.land("land")
             self.assertIn("awaiting merge; change the mode when the queue is empty", self.land("mode", "merge", ok=False))
-            candidate = sh("git", "rev-parse", "landing/q1", cwd=self.base / "origin.git")
+            candidate = sh("git", "rev-parse", "landing/e1", cwd=self.base / "origin.git")
             (self.base / "pr-state").write_text(f"MERGED {candidate} abc123")
             self.land("land")
             self.assertEqual(self.land("mode", "merge", "--merge-method", "squash"), "landing mode is now merge, merging with --squash")
@@ -1298,7 +1481,7 @@ elif args[:2] == ["pr", "view"]:
             result = subprocess.run([sys.executable, str(SCRIPT), "--repo", str(self.work), "land"], capture_output=True, text=True, env=os.environ.copy())
             self.assertEqual(result.returncode, -9)
             self.land("land")
-            self.assertIn("awaiting-merge (r/D1, w1). https://github.com/o/r/pull/9", self.land("status", "Q1"))
+            self.assertIn("awaiting-merge (r/D1, w1). https://github.com/o/r/pull/9", self.land("status", "E1"))
 
     def test_human_mode_bounces_a_pr_merged_with_a_head_the_queue_did_not_check(self):
         with self.fake_gh():
@@ -1306,7 +1489,7 @@ elif args[:2] == ["pr", "view"]:
             self.queue_one()
             self.land("land")
             (self.base / "pr-state").write_text("MERGED 0123456789abcdef deadbeef")
-            self.assertIn("bounced Q1 (r/D1): merged at deadbeef with head 0123456789ab", self.land("land"))
+            self.assertIn("bounced E1 (r/D1): merged at deadbeef with head 0123456789ab", self.land("land"))
 
     def test_human_mode_pauses_when_trunk_loses_a_landed_commit(self):
         with self.fake_gh():
@@ -1315,8 +1498,8 @@ elif args[:2] == ["pr", "view"]:
             self.land("land")
             sh("git", "fetch", "-q", "origin", cwd=self.work)
             merged = self.commit_on_origin("human merge")
-            (self.base / "pr-state").write_text(f"MERGED {sh('git', 'rev-parse', 'landing/q1', cwd=self.base / 'origin.git')} {merged}")
-            self.assertEqual(self.land("land"), "landed Q1 (r/D1)")
+            (self.base / "pr-state").write_text(f"MERGED {sh('git', 'rev-parse', 'landing/e1', cwd=self.base / 'origin.git')} {merged}")
+            self.assertEqual(self.land("land"), "landed E1 (r/D1)")
             sh("git", "push", "-q", "--force", "origin", "HEAD:main", cwd=self.work)
             self.assertIn("queue paused: trunk no longer contains the last landed commit", self.land("land"))
 
@@ -1352,7 +1535,7 @@ elif args[:2] == ["pr", "view"]:
         self.queue_one()
         self.assertIn("queue paused: push rejected: remote: rejected by policy", self.land("land"))
         self.assertEqual((self.base / "runs").read_text(), "run\n")
-        self.assertIn("Q1 queued", self.land("status", "Q1"))
+        self.assertIn("E1 queued", self.land("status", "E1"))
 
     def test_a_check_that_escapes_its_group_cannot_hold_the_queue(self):
         script = self.base / "escape.py"
@@ -1370,12 +1553,12 @@ elif args[:2] == ["pr", "view"]:
         sha = self.commit("latin", cwd=self.base / "w1")
         self.land("lease", "claim", "--holder", "r/D1", "--paths", "seed.txt,latin.txt")
         self.land("submit", "--holder", "r/D1", "--branch", "w1", "--sha", sha, "--lease", "L1", "--reviewer", REVIEWER)
-        self.assertEqual(self.land("land"), "landed Q1 (r/D1)")
+        self.assertEqual(self.land("land"), "landed E1 (r/D1)")
 
     def test_non_ascii_file_names_match_their_lease(self):
         self.init()
-        self.assertEqual(self.queue_one(path="café.txt"), "Q1")
-        self.assertEqual(self.land("land"), "landed Q1 (r/D1)")
+        self.assertEqual(self.queue_one(path="café.txt"), "E1")
+        self.assertEqual(self.land("land"), "landed E1 (r/D1)")
 
     def test_landing_works_without_a_git_identity(self):
         self.init()
@@ -1385,7 +1568,7 @@ elif args[:2] == ["pr", "view"]:
         bare_env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
         bare_env.update({"HOME": str(empty), "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null"})
         result = subprocess.run([sys.executable, str(SCRIPT), "--repo", str(self.work), "land"], capture_output=True, text=True, env=bare_env)
-        self.assertEqual(result.stdout.strip(), "landed Q1 (r/D1)", result.stderr)
+        self.assertEqual(result.stdout.strip(), "landed E1 (r/D1)", result.stderr)
 
     def test_fingerprint_sees_whitespace_and_ignores_line_numbers(self):
         repo = self.work
@@ -1408,7 +1591,7 @@ elif args[:2] == ["pr", "view"]:
         sha = self.worker("w1", {"a.txt": "agent\n"})
         self.land("lease", "claim", "--holder", "r/D1", "--paths", "a.txt")
         self.land("submit", "--holder", "r/D1", "--branch", "w1", "--sha", sha, "--lease", "L1", "--reviewer", REVIEWER)
-        self.assertIn("bounced Q1 (r/D1): checks failed: `sleep 30` timed out", self.land("land"))
+        self.assertIn("bounced E1 (r/D1): checks failed: `sleep 30` timed out", self.land("land"))
 
     def test_the_contract_refuses_a_conflicting_init_and_other_clones(self):
         self.init()
@@ -1466,8 +1649,8 @@ elif args[:2] == ["pr", "view"]:
         store.db.executescript(land.SCHEMA)
         self.assertNotIn("title", {row["name"] for row in store.db.execute("PRAGMA table_info(entry)")})
         store.db.close()
-        self.assertEqual(self.queue_one(), "Q1")
-        self.assertEqual(self.land("land"), "landed Q1 (r/D1)")
+        self.assertEqual(self.queue_one(), "E1")
+        self.assertEqual(self.land("land"), "landed E1 (r/D1)")
 
     def test_nested_slots_do_not_deadlock_with_one_slot(self):
         governor = self.base / "state/pstack-t3/governor"
