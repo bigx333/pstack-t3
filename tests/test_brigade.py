@@ -1,8 +1,10 @@
 import json
 import os
+import runpy
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -11,6 +13,62 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "t3/added/brigade/scripts/brigade.py"
 CODEX = "codex/gpt-6.1-sol"
 CLAUDE = "claudeAgent/claude-opus-5-5"
+
+
+def _wait_for_path(path, timeout=8):
+    end = time.monotonic() + timeout
+    while not path.exists():
+        if time.monotonic() > end:
+            raise TimeoutError(path)
+        time.sleep(0.005)
+
+
+def _race_child(mode, case, args):
+    case = Path(case)
+    mod = runpy.run_path(str(SCRIPT))
+    # run_path returns a copy. The live functions read the original globals.
+    glob = mod["run"].__globals__
+    if mode == "owner":
+        original = glob["write_atomic"]
+
+        def hooked(path, content):
+            original(path, content)
+            if Path(path).name == "restaurant.json":
+                (case / "metadata-ready").touch()
+                _wait_for_path(case / "owner-proceed")
+
+        glob["write_atomic"] = hooked
+    elif mode == "loser":
+        original_wait = glob["wait_for_meta"]
+
+        def hooked_wait(directory):
+            meta = original_wait(directory)
+            (case / "loser-saw-meta").touch()
+            _wait_for_path(case / "loser-after-meta")
+            return meta
+
+        glob["wait_for_meta"] = hooked_wait
+        original_write = glob["write_atomic"]
+
+        def hooked_write(path, content):
+            if Path(path).name in ("menu.md", "house-rules.md"):
+                (case / "loser-at-scaffold").touch()
+                _wait_for_path(case / "loser-scaffold-proceed")
+            return original_write(path, content)
+
+        glob["write_atomic"] = hooked_write
+        original_save = glob["Restaurant"].save_rows
+
+        def hooked_save(self, table, rows):
+            if table == "rail.tsv" and rows == []:
+                (case / "loser-at-scaffold").touch()
+                _wait_for_path(case / "loser-scaffold-proceed")
+            return original_save(self, table, rows)
+
+        glob["Restaurant"].save_rows = hooked_save
+    else:
+        raise SystemExit(f"unknown mode {mode}")
+    sys.exit(mod["main"](args))
 
 
 class BrigadeTest(unittest.TestCase):
@@ -312,7 +370,12 @@ class BrigadeTest(unittest.TestCase):
         other = self.brigade("open", "--project-root", str(self.project), "--name", "Quiet",
                              "--landing", "local", "--reporting", "digest")
         quiet = self.store / "bridge-kit" / "quiet"
-        self.assertEqual(other, f"opened {quiet}")
+        self.assertEqual(other, "\n".join([
+            f"opened {quiet}",
+            f"sibling Perf ({self.at}), thread not recorded",
+            "  purpose: not written yet",
+            "  off the menu: not written yet",
+        ]))
         self.assertEqual(json.loads((quiet / "restaurant.json").read_text())["reporting"], "digest")
         self.assertIn("reports digest", self.brigade("walk"))
 
@@ -501,6 +564,204 @@ class BrigadeTest(unittest.TestCase):
         self.brigade("hang", "D1", "--provider", "grok/grok-4.7", "--minutes", "20")
         self.assertEqual(len([row for row in self.log_rows() if row["kind"] == "hang"]), 2)
 
+    def test_open_prints_the_sibling_on_the_same_project_root(self):
+        self.open()
+        menu = (self.at / "menu.md").read_text()
+        menu = menu.replace(
+            "What this restaurant exists to achieve, in one or two sentences.",
+            "Keep startup under 400 ms.")
+        menu = menu.replace(
+            "Work this restaurant does not take, even when asked.",
+            "Docs and release notes\nVendor upgrades")
+        (self.at / "menu.md").write_text(menu)
+        self.brigade("set", "--thread", "thread-perf")
+        docs_dir = self.store / "bridge-kit" / "docs"
+        self.assertEqual(
+            self.brigade("open", "--project-root", str(self.project), "--name", "Docs", "--landing", "merge"),
+            "\n".join([
+                f"opened {docs_dir}",
+                f"sibling Perf ({self.at}), thread thread-perf",
+                "  purpose: Keep startup under 400 ms.",
+                "  off the menu: Docs and release notes; Vendor upgrades",
+            ]))
+        self.assertEqual(
+            self.brigade("open", "--project-root", str(self.project), "--name", "Perf", "--landing", "merge"),
+            "\n".join([
+                f"exists {self.at}",
+                "thread thread-perf already recorded",
+                f"sibling Docs ({docs_dir}), thread not recorded",
+                "  purpose: not written yet",
+                "  off the menu: not written yet",
+            ]))
+
+    def test_open_refuses_a_directory_that_holds_another_project_root(self):
+        first = (Path(self.temporary.name) / "left" / "app").resolve()
+        second = (Path(self.temporary.name) / "right" / "app").resolve()
+        first.mkdir(parents=True)
+        second.mkdir(parents=True)
+        directory = self.store / "app" / "docs"
+        self.assertEqual(
+            self.brigade("open", "--project-root", str(first), "--name", "Docs", "--landing", "merge"),
+            f"opened {directory}")
+        before = (directory / "restaurant.json").read_bytes()
+        error = self.brigade("open", "--project-root", str(second), "--name", "Docs", "--landing", "local", ok=False)
+        self.assertEqual(
+            error,
+            f"brigade: {directory} already holds a coordinator for {first}; pick another --name")
+        self.assertEqual((directory / "restaurant.json").read_bytes(), before)
+
+    def test_two_processes_opening_one_name_on_different_roots_leave_one_store(self):
+        roots = []
+        for label in ("left", "right"):
+            path = (Path(self.temporary.name) / label / "app").resolve()
+            path.mkdir(parents=True)
+            roots.append(path)
+        directory = self.store / "app" / "docs"
+        procs = [
+            subprocess.Popen(
+                [sys.executable, str(SCRIPT), "--store", str(self.store),
+                 "open", "--project-root", str(root), "--name", "Docs", "--landing", "merge"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            for root in roots
+        ]
+        finished = []
+        for proc in procs:
+            out, err = proc.communicate(timeout=15)
+            finished.append((proc.returncode, out, err))
+        self.assertEqual(sorted(code for code, _, _ in finished), [0, 1])
+        self.assertEqual(len(list((directory.parent).glob("*/restaurant.json"))), 1)
+        meta = json.loads((directory / "restaurant.json").read_text())
+        winner = next(item for item in finished if item[0] == 0)
+        loser = next(item for item in finished if item[0] == 1)
+        self.assertIn(meta["projectRoot"], [str(root) for root in roots])
+        self.assertTrue(winner[1].startswith(f"opened {directory}"))
+        self.assertIn(f"already holds a coordinator for {meta['projectRoot']}", loser[2])
+        self.assertIn("pick another --name", loser[2])
+
+    def test_set_thread_refuses_to_replace_a_recorded_thread(self):
+        self.open()
+        self.brigade("set", "--thread", "thread-1")
+        self.brigade("set", "--thread", "thread-1")
+        before = (self.at / "restaurant.json").read_bytes()
+        error = self.brigade("set", "--thread", "thread-2", ok=False)
+        self.assertEqual(error, "brigade: thread thread-1 already recorded")
+        self.assertEqual((self.at / "restaurant.json").read_bytes(), before)
+        self.brigade("set", "--thread", "thread-2", "--replace")
+        self.assertEqual(json.loads((self.at / "restaurant.json").read_text())["thread"], "thread-2")
+
+    def _spawn_race(self, mode, case, args):
+        return subprocess.Popen(
+            [sys.executable, str(Path(__file__).resolve()), "--race-child", mode, str(case), *args],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"))
+
+    def _finish_race(self, proc):
+        try:
+            out, err = proc.communicate(timeout=12)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            out, err = proc.communicate()
+            self.fail(f"timed out\nstdout:\n{out}\nstderr:\n{err}")
+        return proc.returncode, out.strip(), err.strip()
+
+    def test_a_losing_open_keeps_the_owners_ticket_and_menu(self):
+        case = Path(self.temporary.name) / "race"
+        case.mkdir()
+        project = Path(self.temporary.name) / "app"
+        project.mkdir()
+        directory = self.store / "app" / "docs"
+        args = ["--store", str(self.store), "open", "--project-root", str(project), "--name", "Docs", "--landing", "merge"]
+        owner = loser = None
+        try:
+            owner = self._spawn_race("owner", case, args)
+            _wait_for_path(case / "metadata-ready")
+            loser = self._spawn_race("loser", case, args)
+            _wait_for_path(case / "loser-saw-meta")
+            self.assertIsNone(owner.poll())
+            self.assertIsNone(loser.poll())
+            if not (directory / "rail.tsv").exists():
+                (case / "loser-after-meta").touch()
+                _wait_for_path(case / "loser-at-scaffold")
+                (case / "owner-proceed").touch()
+                owner_code, owner_out, owner_err = self._finish_race(owner)
+                owner = None
+            else:
+                owner_code = owner_out = owner_err = None
+            added = subprocess.run(
+                [sys.executable, str(SCRIPT), "--at", str(directory), "ticket", "add", "--summary", "Keep this ticket"],
+                capture_output=True, text=True, env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"))
+            self.assertEqual((added.returncode, added.stdout), (0, "T1\n"), added.stderr)
+            menu = directory / "menu.md"
+            menu.write_text(menu.read_text() + "Keep the menu sentence.\n")
+            if (case / "loser-at-scaffold").exists():
+                (case / "loser-scaffold-proceed").touch()
+            else:
+                (case / "loser-after-meta").touch()
+            loser_code, loser_out, loser_err = self._finish_race(loser)
+            loser = None
+            if owner is not None:
+                (case / "owner-proceed").touch()
+                owner_code, owner_out, owner_err = self._finish_race(owner)
+                owner = None
+        finally:
+            for proc in (owner, loser):
+                if proc is not None and proc.poll() is None:
+                    proc.kill()
+                    proc.wait(timeout=5)
+        self.assertEqual((owner_code, owner_err), (0, ""), owner_out)
+        self.assertEqual(owner_out, f"opened {directory}")
+        self.assertEqual((loser_code, loser_err), (0, ""), loser_out)
+        self.assertEqual(loser_out, f"exists {directory}")
+        self.assertIn("Keep this ticket", (directory / "rail.tsv").read_text())
+        self.assertIn("Keep the menu sentence.", (directory / "menu.md").read_text())
+
+    def test_open_rejects_a_restaurant_json_that_is_not_valid_json(self):
+        self.at.mkdir(parents=True)
+        (self.at / "restaurant.json").write_text('{"restaurant":')
+        started = time.monotonic()
+        error = self.brigade("open", "--project-root", str(self.project), "--name", "Perf", "--landing", "merge", ok=False)
+        elapsed = time.monotonic() - started
+        self.assertEqual(error, f"brigade: {self.at / 'restaurant.json'} is not valid JSON")
+        self.assertGreaterEqual(elapsed, 0.9)
+        self.assertLess(elapsed, 3)
+        self.assertEqual((self.at / "restaurant.json").read_text(), '{"restaurant":')
+        self.assertFalse((self.at / "menu.md").exists())
+        self.assertFalse((self.at / "rail.tsv").exists())
+
+    def test_open_accepts_restaurant_json_that_becomes_valid_within_one_second(self):
+        self.at.mkdir(parents=True)
+        path = self.at / "restaurant.json"
+        path.write_text('{"restaurant":')
+        proc = subprocess.Popen(
+            [sys.executable, str(SCRIPT), "--store", str(self.store), "open",
+             "--project-root", str(self.project), "--name", "Perf", "--landing", "merge"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"))
+        try:
+            time.sleep(0.2)
+            self.assertIsNone(proc.poll())
+            path.write_text(json.dumps({
+                "restaurant": "Perf",
+                "projectRoot": str(self.project.resolve()),
+                "landing": "merge",
+                "thread": None,
+                "schedules": {},
+            }))
+            out, err = proc.communicate(timeout=3)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            out, err = proc.communicate()
+            self.fail(f"timed out\nstdout:\n{out}\nstderr:\n{err}")
+        self.assertEqual((proc.returncode, err.strip()), (0, ""), out)
+        self.assertTrue(out.startswith(f"exists {self.at}"))
+
 
 if __name__ == "__main__":
-    unittest.main()
+    if len(sys.argv) > 1 and sys.argv[1] == "--race-child":
+        try:
+            _race_child(sys.argv[2], sys.argv[3], sys.argv[4:])
+        except TimeoutError as error:
+            print(f"race child timed out waiting for {error}", file=sys.stderr)
+            sys.exit(2)
+    else:
+        unittest.main()
