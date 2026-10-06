@@ -11,7 +11,11 @@ Write `~/.config/pstack-t3/roles.json`, the per-role seat table that every pstac
 
 ## Steps
 
-### 1. Read the catalog
+### 1. Check the host and read the catalog
+
+Check the host's tool list for `watch_pull_request`. Accept the T3 harness prefixes described in [the runtime](../pstack-runtime/SKILL.md). A tool listed by name counts as present, including a harness prefix. A deferred `watch_pull_request` counts as present and does not fail this gate. If tools load lazily, use the host's tool discovery and make one bounded `orchestrator_capabilities` call before checking again. A provider catalog does not prove that the watch tool exists. Do not call `watch_pull_request` with a dummy PR to test it.
+
+If `watch_pull_request` is absent, stop setup before writing roles or a saved catalog. Say "Setup cannot finish. T3 Code 0.0.46-nightly.20261005.2702 or later is required because this host does not expose watch_pull_request." Ask the user to update T3 Code and rerun setup. Do not report setup complete.
 
 Call `orchestrator_capabilities`. Save its JSON result verbatim to a temporary file, for example `/tmp/pstack-t3-catalog.json`. That file is the only source of valid providers, models, and options. Never write a seat that is not in it.
 
@@ -29,23 +33,15 @@ This prints every role with its seats and `source` (`default`, the user file, or
 
 **(a) Ask for a budget.** Use the host's question tool if it has one. Offer these labels, and name the current budget.
 
-- `default — each model's own default reasoning`
-- `unlimited — highest reasoning each model offers`
+- `default — built-in role reasoning or configured seat options`
+- `unlimited — max reasoning`
 - `large — xhigh reasoning`
 - `medium — high reasoning`
 - `small — medium reasoning`
 
-The budget sets the reasoning option (`effort`, `reasoningEffort`, `reasoning_effort`, or `reasoning`) of every seat to its level, or the closest lower level the model offers. A seat that names a lower level keeps it. A model without such an option is unaffected. `ultracode` and `ultrathink` are never set by a budget.
+The budget caps the reasoning option (`effort`, `reasoningEffort`, `reasoning_effort`, or `reasoning`). A seat at or below the cap keeps its level. A seat above the cap drops to the cap, or the closest lower level the model offers. A seat that names no level receives the cap. `default` leaves a built-in or configured level as it is. `unlimited` raises a built-in preferred seat to the model's highest non-special level. The default Opus seat moves from xhigh to max. Grok's ladder tops out at xhigh, so the default Grok seat stays at xhigh. A configured seat that names its own level keeps that level when it is at or below the cap. A model without such an option is unaffected. `ultracode` and `ultrathink` are never set by a budget.
 
-**(b) Propose roles.** Start from the current state. Then suggest a split by strength that uses only runnable providers. A good default when several providers are runnable:
-
-- Code roles (`feature, refactoring`, `bug-fix`, `perf-issue`, `hillclimb`, `swarm workers`, `how explorer`, `why investigators`): the fastest strong coding model the user has.
-- Judgment roles (`judgment and prose`, `hardest tasks`, `how explainer`, `why synthesizer`, `reflect judgment, divergent, synthesizer`): the strongest reasoning model.
-- `reflect tooling`: a model from a different model family than the judgment model.
-- Panel roles (`arena runners`, `arena cross-judge pool`, `architect runners`, `interrogate reviewers`, `verifiers`): one seat per model family (Claude, GPT, Grok, Gemini, and so on), each on a runnable provider. One provider can serve several families, and two providers can serve the same one, so count families, not providers.
-- `skill tests`: one cheap fast model from a family other than the thread writing the skill, when the catalog has one. Leave the role unset so the built-in default stays.
-
-Say which model you picked for each tier and why, in one line each. Marking a role `inherit` means it runs on whatever model the calling thread uses.
+**(b) Propose roles.** The built-in defaults are Claude Opus (`claude-opus-5-5`) at xhigh for judgment roles and Grok (`grok-4.7`) at xhigh for code roles. Under `unlimited`, those seats rise as step 3(a) describes. Opus moves to max, and Grok stays at xhigh. `arena runners`, `arena cross-judge pool`, `architect runners`, and `interrogate reviewers` use those two seats, judgment first. `skill tests` and `verifiers` stay on their catalog rules. Start from `roles.py show` in step 2. Keep configured roles unless the user changes them. Use the built-in seats for roles with `source: "default"`. Offer `large` for a new setup. It matches the built-in xhigh ceiling. Show each fallback note beside its role and seat. Codex and every other runnable configured provider remain available as user choices. Leave `skill tests` unset so its adaptive default stays.
 
 **(c) Confirm.** Show every role with its seats. Ask whether to accept as-is or change specific roles. For panel roles the seat count is the panel size.
 
@@ -55,12 +51,12 @@ Build one `--set` per role you are writing. A seat is `inherit` or `provider/mod
 
 ```bash
 python3 <runtime>/scripts/roles.py write --catalog /tmp/pstack-t3-catalog.json --budget large \
-  --set "judgment and prose=claudeAgent/claude-opus-5-5?effort=max" \
-  --set "swarm workers=grok/grok-4.7" \
-  --set "interrogate reviewers=inherit;codex/gpt-6.1-sol;grok/grok-4.7"
+  --set "judgment and prose=claudeAgent/claude-opus-5-5?effort=xhigh" \
+  --set "swarm workers=grok/grok-4.7?reasoningEffort=xhigh" \
+  --set "interrogate reviewers=claudeAgent/claude-opus-5-5?effort=xhigh;grok/grok-4.7?reasoningEffort=xhigh"
 ```
 
-The provider and model IDs above are examples. Use IDs from step 1.
+The provider, model, and option IDs above are examples. Use IDs from step 1. Add `fastMode` only when the chosen model is in the grok family and declares that boolean option. A fallback to another family does not set it.
 
 - The command overwrites the whole file, so re-runs are idempotent. Add `--keep` to keep roles you did not pass.
 - It refuses to write a seat that does not match the catalog and prints why. Fix the seat and rerun. Do not pass `--force` unless the user asks.
@@ -69,11 +65,11 @@ The provider and model IDs above are examples. Use IDs from step 1.
 
 ### 5. Verify
 
-Run `python3 <runtime>/scripts/roles.py show --cwd "$PWD" --parent "<inheritedProviderInstanceId>/<inheritedModel>"` and check that every role shows the seats you wrote, with no `notes`. `info` lines, such as an `inherit` seat made explicit for the budget, are expected. Then run one smoke delegation to each distinct provider in the table: `delegate_task` with `mode: "wait"`, `timeoutMs: 120000`, the seat's target, and the task "Reply with the single word ready." A seat that fails here is not usable. Fix it and rerun step 4.
+Run `python3 <runtime>/scripts/roles.py show --cwd "$PWD" --parent "<inheritedProviderInstanceId>/<inheritedModel>"`. Check that configured seats resolve with no mismatch notes. For unset roles, review and report each default fallback note. A default fallback does not invalidate an otherwise runnable setup. `info` lines, such as an `inherit` seat made explicit for the budget, are expected. Then run one smoke delegation to each distinct provider in the table: `delegate_task` with `mode: "wait"`, `timeoutMs: 120000`, the seat's target, and the task "Reply with the single word ready." A seat that fails here is not usable. Fix it and rerun step 4.
 
 ### 6. Confirm
 
-Tell the user which file was written, the budget, any provider they could enable in T3 settings to widen the panels, and that new sessions pick it up immediately. Re-running this skill updates it.
+Do this only after step 1 found `watch_pull_request` and step 5's smoke delegations succeeded. Tell the user which file was written, the budget, any provider they could enable in T3 settings to widen the panels, and that new sessions pick it up immediately. Re-running this skill updates it.
 
 ### 7. Offer a verification skill (optional)
 
