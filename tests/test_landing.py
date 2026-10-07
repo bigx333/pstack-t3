@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -17,6 +18,7 @@ sys.path.insert(0, str(SCRIPT.parent))
 import land  # noqa: E402
 
 REVIEWER = "codex/gpt-6.1-sol"
+ADMIN = ("--owner", ".admin/@1")
 
 
 def stamp_in(hours):
@@ -35,6 +37,22 @@ def sh(*args, cwd):
     if result.returncode != 0:
         raise AssertionError(f"{args} failed: {result.stderr}")
     return result.stdout.strip()
+
+
+def paused_child(case, args):
+    """Run land.py with its first transaction held until <case>/proceed exists, as a command started before a recovery."""
+    case = Path(case)
+    original = land.Store.tx
+
+    def paused_tx(self):
+        (case / "paused").touch()
+        deadline = time.monotonic() + 60
+        while not (case / "proceed").exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        return original(self)
+
+    land.Store.tx = paused_tx
+    sys.exit(land.main(args))
 
 
 class LandingTest(unittest.TestCase):
@@ -1818,7 +1836,7 @@ os.execv({real!r}, [{real!r}, *args])
             self.assertTrue(self.land("lease", "list").startswith("L1 active r/D1"))
             self.assertTrue(self.ref_exists("refs/heads/landing/e1", self.base / "origin.git"))
 
-    def test_merge_mode_reports_a_failure_to_disable_auto_merge_on_bounce(self):
+    def test_merge_mode_pauses_when_it_cannot_disable_auto_merge_on_a_failed_pr(self):
         with self.fake_gh():
             (self.base / "required-checks").write_text("")
             (self.base / "disable-auto-fails").write_text("API unavailable")
@@ -1828,10 +1846,15 @@ os.execv({real!r}, [{real!r}, *args])
             self.land("land")
             self.land("land")
             (self.base / "checks").write_text("failed")
-            out = self.land("land")
-            self.assertIn("bounced E1 (r/D1): required checks failed on https://github.com/o/r/pull/9: test (3.12)", out)
-            self.assertIn("auto-merge still enabled: API unavailable", out)
+            self.assertEqual(self.land("land"), "queue paused: required checks failed on https://github.com/o/r/pull/9: test (3.12). "
+                                                "Auto-merge is still enabled: API unavailable. Turn auto-merge off on https://github.com/o/r/pull/9, "
+                                                "then run land.py resume and land.py land")
+            self.assertTrue(self.land("status", "E1").startswith("E1 awaiting-merge"))
             self.assertNotIn("pr close", (self.base / "gh-calls").read_text())
+            self.assertTrue(self.land("lease", "list").startswith("L1 submitted"))
+            (self.base / "auto-merge-request.json").unlink()
+            self.land("resume")
+            self.assertIn("bounced E1 (r/D1): required checks failed on https://github.com/o/r/pull/9: test (3.12)", self.land("land"))
             self.assertTrue(self.land("lease", "list").startswith("L1 active"))
 
     def test_merge_mode_skips_disable_auto_when_auto_merge_request_is_null(self):
@@ -1847,7 +1870,7 @@ os.execv({real!r}, [{real!r}, *args])
             self.assertNotIn("auto-merge still enabled", self.land("status", "E1"))
             self.assertTrue(self.land("lease", "list").startswith("L1 active"))
 
-    def test_merge_mode_reports_disable_auto_failure_when_auto_merge_request_is_set(self):
+    def test_merge_mode_pauses_on_a_disable_auto_failure_when_auto_merge_request_is_set(self):
         with self.fake_gh():
             (self.base / "required-checks").write_text("")
             self.arm_auto_merge()
@@ -1858,8 +1881,9 @@ os.execv({real!r}, [{real!r}, *args])
             self.land("land")
             (self.base / "checks").write_text("failed")
             out = self.land("land")
-            self.assertIn("bounced E1 (r/D1): required checks failed on https://github.com/o/r/pull/9: test (3.12)", out)
-            self.assertIn("auto-merge still enabled: GraphQL: Auto merge is not enabled for this pull request", out)
+            self.assertIn("queue paused: required checks failed on https://github.com/o/r/pull/9: test (3.12). "
+                          "Auto-merge is still enabled: GraphQL: Auto merge is not enabled for this pull request", out)
+            self.assertTrue(self.land("status", "E1").startswith("E1 awaiting-merge"))
             self.assertIn("pr merge https://github.com/o/r/pull/9 --disable-auto", (self.base / "merge-calls").read_text())
             self.assertNotIn("pr close", (self.base / "gh-calls").read_text())
 
@@ -2245,5 +2269,445 @@ os.execv({real!r}, [{real!r}, *args])
         self.assertEqual(result.returncode, 0, result.stderr)
 
 
+    def reserve(self, prefix, paths, ruling, *extra, ok=True):
+        return self.land("lease", "reserve", "--for", prefix, "--paths", paths, "--ruling", ruling, *ADMIN, *extra, ok=ok)
+
+    def share(self, prefix, count, *extra, ok=True):
+        return self.land("share", "--for", prefix, str(count), *ADMIN, *extra, ok=ok)
+
+    def contest(self, *args, ok=True):
+        return self.land("contest", *args, *ADMIN, ok=ok)
+
+    def ruling_rows(self, table):
+        store = land.Store.for_repo(self.work)
+        try:
+            return [dict(row) for row in store.db.execute(f"SELECT * FROM {table} ORDER BY 1")]
+        finally:
+            store.db.close()
+
+    def reserved_until(self, number):
+        return next(row for row in self.ruling_rows("reservation") if row["id"] == number)["expires"][:16]
+
+    def listed(self):
+        """lease list with each expiry cut out, so lines compare as literals."""
+        return [re.sub(r" until \S+:", ":", line) for line in self.land("lease", "list").splitlines()]
+
+    def concurrent(self, *commands):
+        procs = [subprocess.Popen([sys.executable, str(SCRIPT), "--repo", str(self.work), *command],
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=os.environ.copy())
+                 for command in commands]
+        return [(proc.wait(), *(part.strip() for part in proc.communicate())) for proc in procs]
+
+    def test_a_reservation_refuses_another_holders_claim_and_admits_the_winner(self):
+        self.init()
+        self.assertEqual(self.reserve("docs/", "a.txt,b.txt", "R4"), "S1")
+        refusal = self.claim("engine/D3", "a.txt", ok=False)
+        self.assertEqual(refusal, f"land: paths reserved for docs/ by ruling R4 until {self.reserved_until(1)}")
+        self.assertEqual(self.lease_check("engine/D3", "b.txt"), (1, refusal.removeprefix("land: ")))
+        self.assertEqual(self.claim("engine/D3", "lib"), "L1")
+        self.assertEqual(self.claim("docs/D7", "a.txt,b.txt"), "L2")
+        self.assertEqual(self.listed(), ["L1 active engine/D3: lib", "L2 active docs/D7: a.txt, b.txt"])
+        self.assertEqual(self.ruling_rows("reservation")[0]["state"], "claimed")
+
+    def test_a_reservation_refuses_readmitting_another_holders_expired_lease(self):
+        self.init()
+        self.assertEqual(self.claim("engine/D3", "a.txt", "--ttl-hours", "0"), "L1")
+        self.assertEqual(self.reserve("docs/", "a.txt", "R4"), "S1")
+        self.assertEqual(self.land("lease", "renew", "L1", ok=False),
+                         f"land: paths reserved for docs/ by ruling R4 until {self.reserved_until(1)}")
+        self.assertEqual(self.listed(), ["S1 armed docs/ by R4: a.txt"])
+        self.assertEqual(self.claim("docs/D7", "a.txt"), "L2")
+
+    def test_a_claim_covering_one_reserved_path_leaves_the_other_and_counts_once(self):
+        self.init()
+        self.land("cap", "2")
+        self.reserve("docs/", "a.txt,b.txt", "R4")
+        self.assertIn("changes in flight: 1 of 2", self.land("status"))
+        self.assertEqual(self.claim("docs/D7", "a.txt"), "L1")
+        self.assertEqual(self.land("status"), "push mode onto refs/remotes/origin/main. leases held: 1, changes in flight: 1 of 2.")
+        self.assertEqual(self.listed(), ["L1 active docs/D7: a.txt", "S1 armed docs/ by R4: b.txt"])
+        self.assertIn("paths reserved for docs/ by ruling R4", self.claim("engine/D3", "b.txt", ok=False))
+        self.assertEqual(self.claim("engine/D3", "lib"), "L2")
+        self.assertEqual(self.claim("ops/D1", "c.txt", ok=False), "land: repository at its cap: 2 of 2 changes in flight (docs/D7, engine/D3)")
+
+    def test_a_reservation_waits_to_arm_while_another_holders_live_lease_overlaps(self):
+        self.init()
+        self.claim("engine/D1", "a.txt")
+        self.assertEqual(self.reserve("docs/", "a.txt,b.txt", "R4"), "S1")
+        self.assertEqual(self.lease_check("ops/D1", "c.txt"), (0, "free"))
+        self.assertEqual(self.listed(), ["L1 active engine/D1: a.txt", "S1 waiting docs/ by R4: a.txt, b.txt"])
+        waiting = "paths reserved for docs/ by ruling R4 until 2 hours after it arms"
+        self.assertEqual(self.claim("engine/D2", "b.txt", ok=False), f"land: {waiting}")
+        self.assertEqual(self.lease_check("engine/D2", "b.txt"), (1, waiting))
+        self.assertEqual(self.ruling_rows("reservation")[0]["armed"], "")
+        self.land("lease", "release", "L1")
+        self.assertEqual(self.lease_check("ops/D1", "c.txt"), (0, "free"))
+        self.assertEqual(self.listed(), ["S1 armed docs/ by R4: a.txt, b.txt"])
+        armed = next(row for row in self.ruling_rows("reservation") if row["id"] == 1)
+        left = datetime.fromisoformat(armed["expires"]) - datetime.now(timezone.utc)
+        self.assertLess(abs(left - timedelta(hours=2)), timedelta(minutes=1))
+
+    def test_with_a_cap_of_one_two_waiting_reservations_arm_one_at_a_time_oldest_first(self):
+        self.init()
+        self.land("cap", "1")
+        self.claim("ops/D1", "lib")
+        self.assertEqual(self.reserve("docs/", "a.txt", "R1"), "S1")
+        self.assertEqual(self.reserve("engine/", "b.txt", "R2"), "S2")
+        self.assertEqual(self.listed(), ["L1 active ops/D1: lib", "S1 waiting docs/ by R1: a.txt", "S2 waiting engine/ by R2: b.txt"])
+        self.land("lease", "release", "L1")
+        self.assertEqual(self.lease_check("ops/D2", "c.txt"), (1, "repository at its cap: 1 of 1 changes in flight (S1 for docs/)"))
+        self.assertEqual(self.listed(), ["S1 armed docs/ by R1: a.txt", "S2 waiting engine/ by R2: b.txt"])
+        self.assertEqual(self.claim("docs/D7", "a.txt"), "L2")
+        self.assertEqual(self.listed(), ["L2 active docs/D7: a.txt", "S2 waiting engine/ by R2: b.txt"])
+        self.assertEqual(self.claim("engine/D3", "b.txt", ok=False), "land: repository at its cap: 1 of 1 changes in flight (docs/D7)")
+        self.land("lease", "release", "L2")
+        self.assertEqual(self.claim("engine/D3", "b.txt"), "L3")
+        self.assertEqual(self.listed(), ["L3 active engine/D3: b.txt"])
+
+    def test_two_coordinators_claiming_reserved_paths_at_once_leave_only_the_winners_lease(self):
+        self.init()
+        for n in range(1, 5):
+            self.reserve("docs/", f"p{n}.txt", f"R{n}")
+            results = self.concurrent(["lease", "claim", "--holder", f"engine/D{n}", "--paths", f"p{n}.txt"],
+                                      ["lease", "claim", "--holder", f"docs/D{n}", "--paths", f"p{n}.txt"])
+            (engine_code, _, engine_err), (docs_code, docs_out, _) = results
+            self.assertEqual((engine_code, docs_code, docs_out), (1, 0, f"L{n}"), results)
+            self.assertTrue(engine_err.startswith("land: paths "), engine_err)
+        self.assertEqual(self.listed(), [f"L{n} active docs/D{n}: p{n}.txt" for n in range(1, 5)])
+
+    def test_a_reservation_rerun_returns_it_and_an_ended_one_says_how_it_ended(self):
+        self.init()
+        self.assertEqual(self.reserve("docs/", "a.txt", "R4"), "S1")
+        self.assertEqual(self.reserve("docs/", "a.txt", "R4"), "S1")
+        self.assertEqual(self.reserve("engine/", "a.txt,b.txt", "R5", ok=False), "land: paths overlap S1 reserved for docs/ by ruling R4 on a.txt")
+        self.assertEqual(self.land("lease", "unreserve", "S1", *ADMIN), "S1 lifted")
+        self.assertEqual(self.land("lease", "unreserve", "S1", *ADMIN), "S1 lifted")
+        self.assertEqual(self.reserve("docs/", "a.txt", "R4", ok=False), "land: S1 for ruling R4 was lifted")
+        self.assertEqual(self.claim("engine/D3", "a.txt"), "L1")
+        self.assertEqual(self.reserve("docs/", "b.txt", "R6", "--ttl-hours", "0"), "S2")
+        self.assertEqual(self.reserve("docs/", "b.txt", "R6", ok=False), "land: S2 for ruling R6 expired")
+        self.assertEqual(self.claim("engine/D4", "b.txt"), "L2")
+        self.assertRegex(self.land("lease", "unreserve", "S2", *ADMIN), r"^S2 expired at \d{4}-\d\d-\d\dT\d\d:\d\d$")
+        self.assertEqual(self.land("lease", "unreserve", "S9", *ADMIN, ok=False), "land: no S9")
+        self.assertEqual(self.reserve("docs", "c.txt", "R7", ok=False), "land: 'docs' is not a holder prefix such as docs/")
+        self.assertEqual(self.reserve("docs/", "c.txt", "R8"), "S3")
+        self.assertEqual(self.claim("docs/D7", "c.txt"), "L3")
+        self.assertEqual(self.reserve("docs/", "c.txt", "R8"), "S3 was claimed in full")
+
+    def test_a_reservation_refuses_the_whole_repository(self):
+        self.init()
+        refusal = "land: a reservation names the contested paths; it cannot hold the whole repository"
+        self.assertEqual(self.reserve("docs/", "", "R4", ok=False), refusal)
+        self.assertEqual(self.reserve("docs/", "a.txt,.", "R4", ok=False), refusal)
+        self.assertEqual(self.claim("engine/D3", "lib"), "L1")
+        self.assertEqual(self.listed(), ["L1 active engine/D3: lib"])
+
+    def test_shares_refuse_a_sum_over_the_cap_and_admission_refuses_a_claim_over_a_share(self):
+        self.init()
+        self.land("cap", "4")
+        self.assertEqual(self.share("docs/", 2), "docs/ share is 2")
+        self.assertEqual(self.share("engine/", 3, ok=False), "land: shares would add up to 5, over the cap of 4")
+        self.assertEqual(self.share("engine/", 2), "engine/ share is 2")
+        self.assertEqual(self.share("engine/", 2), "engine/ share is 2")
+        self.assertEqual(self.claim("docs/D1", "a.txt"), "L1")
+        self.assertEqual(self.claim("docs/D2", "b.txt"), "L2")
+        self.assertEqual(self.claim("docs/D3", "lib", ok=False), "land: docs/ is at its share: 2 of 2")
+        self.assertEqual(self.lease_check("docs/D3", "lib"), (1, "docs/ is at its share: 2 of 2"))
+        self.assertEqual(self.claim("ops/D1", "lib"), "L3")
+        self.assertEqual(self.share("docs/", 1, "--clear", ok=False), "land: --clear takes 0")
+        self.assertEqual(self.share("docs/", 0, "--clear"), "docs/ share cleared")
+        self.assertEqual(self.claim("docs/D3", "c.txt"), "L4")
+        self.assertEqual([(row["prefix"], row["count"]) for row in self.ruling_rows("share")], [("engine/", 2)])
+
+    def test_an_armed_reservation_counts_toward_its_prefixs_share_until_the_winner_claims(self):
+        self.init()
+        self.share("docs/", 1)
+        self.reserve("docs/", "a.txt", "R4")
+        self.assertEqual(self.claim("docs/D9", "b.txt", ok=False), "land: docs/ is at its share: 1 of 1")
+        self.assertEqual(self.claim("docs/D9", "a.txt"), "L1")
+        self.assertEqual(self.claim("docs/D10", "b.txt", ok=False), "land: docs/ is at its share: 1 of 1")
+
+    def reservation_counts_again_after_its_lease_ends(self, end, limit, refused, outsider):
+        self.init()
+        limit()
+        self.assertEqual(self.reserve("docs/", "a.txt,b.txt", "R4"), "S1")
+        self.assertEqual(self.claim("docs/D7", "a.txt", *(["--ttl-hours", "0"] if end == "expire" else [])), "L1")
+        if end == "release":
+            self.assertEqual(self.land("lease", "release", "L1"), "L1 released")
+        self.assertEqual(self.listed(), ["S1 armed docs/ by R4: b.txt"])
+        self.assertEqual(self.claim(outsider, "lib", ok=False), f"land: {refused}")
+        self.assertEqual(self.lease_check(outsider, "lib"), (1, refused))
+        self.assertEqual(self.claim("docs/D7", "b.txt"), "L2")
+        self.assertEqual(self.listed(), ["L2 active docs/D7: b.txt"])
+        self.assertEqual(self.ruling_rows("reservation")[0]["state"], "claimed")
+
+    def test_a_reservation_counts_toward_the_cap_again_after_its_taken_lease_is_released(self):
+        self.reservation_counts_again_after_its_lease_ends(
+            "release", lambda: self.land("cap", "1"), "repository at its cap: 1 of 1 changes in flight (S1 for docs/)", "engine/D3")
+        self.assertEqual(self.land("status"), "push mode onto refs/remotes/origin/main. leases held: 1, changes in flight: 1 of 1.")
+
+    def test_a_reservation_counts_toward_the_cap_again_after_its_taken_lease_expires(self):
+        self.reservation_counts_again_after_its_lease_ends(
+            "expire", lambda: self.land("cap", "1"), "repository at its cap: 1 of 1 changes in flight (S1 for docs/)", "engine/D3")
+
+    def test_a_reservation_counts_toward_its_share_again_after_its_taken_lease_is_released(self):
+        self.reservation_counts_again_after_its_lease_ends(
+            "release", lambda: self.share("docs/", 1), "docs/ is at its share: 1 of 1", "docs/D8")
+
+    def test_a_reservation_counts_toward_its_share_again_after_its_taken_lease_expires(self):
+        self.reservation_counts_again_after_its_lease_ends(
+            "expire", lambda: self.share("docs/", 1), "docs/ is at its share: 1 of 1", "docs/D8")
+
+    def test_a_reservation_stays_out_of_the_count_while_any_lease_taken_from_it_is_live(self):
+        self.init()
+        self.land("cap", "2")
+        self.reserve("docs/", "a.txt,b.txt,c.txt", "R4")
+        self.assertEqual(self.claim("docs/D7", "a.txt"), "L1")
+        self.assertEqual(self.claim("docs/D7", "b.txt"), "L2")
+        self.land("lease", "release", "L1")
+        self.assertEqual(self.claim("engine/D3", "lib"), "L3")
+        self.land("lease", "release", "L2")
+        self.assertEqual(self.claim("ops/D1", "d.txt", ok=False),
+                         "land: repository at its cap: 2 of 2 changes in flight (engine/D3, S1 for docs/)")
+        self.assertEqual(self.claim("docs/D7", "c.txt"), "L4")
+        self.assertEqual(self.listed(), ["L3 active engine/D3: lib", "L4 active docs/D7: c.txt"])
+
+    def test_the_winner_renews_its_expired_lease_taken_from_a_reservation_at_a_full_cap(self):
+        self.init()
+        self.land("cap", "1")
+        self.reserve("docs/", "a.txt,b.txt", "R4")
+        self.assertEqual(self.claim("docs/D7", "a.txt", "--ttl-hours", "0"), "L1")
+        self.assertEqual(self.land("lease", "renew", "L1"), "L1 renewed")
+        self.assertEqual(self.claim("engine/D3", "lib", ok=False), "land: repository at its cap: 1 of 1 changes in flight (docs/D7)")
+        self.assertEqual(self.listed(), ["L1 active docs/D7: a.txt", "S1 armed docs/ by R4: b.txt"])
+
+    def contest_holds_both_holders(self, mode, **extra):
+        self.init(mode=mode, **extra)
+        self.assertEqual(self.queue_one(path="a.txt", name="w1", holder="docs/D7"), "E1")
+        self.assertEqual(self.contest("--holders", "docs/D7,engine/D3"), "C1")
+        self.assertEqual(self.contest("--holders", "engine/D3,docs/D7"), "C1")
+        self.assertEqual(self.queue_one(path="b.txt", name="w2", holder="engine/D3"), "E2")
+        self.assertEqual(self.land("land"), "still queued: E1 (held by C1), E2 (held by C1)")
+        self.assertEqual(self.land("status", "--holder", "docs/D7").split(" (")[0], "E1 queued")
+        self.assertEqual(self.land("status", "--holder", "engine/D3").split(" (")[0], "E2 queued")
+
+    def test_an_open_contest_holds_both_holders_out_of_a_push_mode_batch(self):
+        self.contest_holds_both_holders("push", batch=4)
+        self.assertEqual(self.queue_one(path="lib/x.py", name="w3", holder="ops/D1"), "E3")
+        self.assertEqual(self.land("land"), "landed E3 (ops/D1)\nstill queued: E1 (held by C1), E2 (held by C1)")
+        self.assertEqual(self.origin_log(), ["w3", "init"])
+
+    def test_an_open_contest_holds_both_holders_in_local_mode(self):
+        self.contest_holds_both_holders("local", trunk="lane", base="main")
+        self.assertEqual(sh("git", "rev-parse", "refs/landing/lane", cwd=self.work), sh("git", "rev-parse", "main", cwd=self.work))
+
+    def test_an_open_contest_keeps_both_holders_out_of_pr_opening_in_human_mode(self):
+        with self.fake_gh():
+            self.contest_holds_both_holders("human")
+            calls = (self.base / "gh-calls").read_text() if (self.base / "gh-calls").exists() else ""
+            self.assertNotIn("pr create", calls)
+            self.assertFalse(self.ref_exists("refs/heads/landing/e1", self.base / "origin.git"))
+
+    def test_an_open_contest_keeps_both_holders_out_of_pr_opening_in_merge_mode(self):
+        with self.fake_gh():
+            self.contest_holds_both_holders("merge")
+            self.assertNotIn("pr create", (self.base / "gh-calls").read_text())
+            self.assertFalse((self.base / "merge-calls").exists())
+
+    def test_a_settled_contest_holds_the_second_holder_until_the_first_lands_after_a_bounce(self):
+        self.init()
+        self.queue_one(path="a.txt", text="BROKEN\n", name="w1", holder="docs/D7")
+        self.contest("--holders", "docs/D7,engine/D3")
+        self.queue_one(path="b.txt", name="w2", holder="engine/D3")
+        settled = "C1: docs/D7 lands first, engine/D3 waits"
+        self.assertEqual(self.contest("--settle", "C1", "--first", "docs/D7"), settled)
+        self.assertEqual(self.contest("--settle", "C1", "--first", "docs/D7"), settled)
+        out = self.land("land")
+        self.assertTrue(out.startswith("bounced E1 (docs/D7): checks failed:"), out)
+        self.assertTrue(out.endswith("\nstill queued: E2 (held by C1)"), out)
+        (self.base / "w1" / "a.txt").write_text("fixed\n")
+        fixed = self.commit("fix", cwd=self.base / "w1")
+        self.assertEqual(self.land("submit", "--holder", "docs/D7", "--branch", "w1", "--sha", fixed, "--lease", "L1", "--reviewer", REVIEWER), "E3")
+        self.assertEqual(self.land("land"), "landed E3 (docs/D7), E2 (engine/D3)")
+        self.assertEqual(self.origin_log(), ["w2", "fix", "w1", "init"])
+        self.assertEqual(self.contest("--settle", "C1", "--first", "docs/D7"), settled)
+        self.assertEqual(self.contest("--settle", "C1", "--first", "engine/D3", ok=False), "land: C1 is done: docs/D7 landed")
+
+    def test_a_contest_settles_again_in_reverse_and_refuses_an_order_that_closes_a_cycle(self):
+        self.init()
+        self.assertEqual(self.contest("--holders", "docs/D7,engine/D3"), "C1")
+        self.contest("--settle", "C1", "--first", "docs/D7")
+        self.assertEqual(self.contest("--settle", "C1", "--first", "engine/D3"), "C1: engine/D3 lands first, docs/D7 waits")
+        self.assertEqual(self.contest("--holders", "docs/D7,ops/D1"), "C2")
+        self.contest("--settle", "C2", "--first", "docs/D7")
+        self.assertEqual(self.contest("--holders", "ops/D1,engine/D3"), "C3")
+        self.assertEqual(self.contest("--settle", "C3", "--first", "ops/D1", ok=False),
+                         "land: C3 cannot order ops/D1 before engine/D3: it closes a cycle with C1, C2")
+        self.assertEqual(self.contest("--settle", "C3", "--first", "engine/D3"), "C3: engine/D3 lands first, ops/D1 waits")
+        self.assertEqual(self.contest("--cancel", "C1"), "C1 cancelled")
+        self.assertEqual(self.contest("--settle", "C3", "--first", "ops/D1"), "C3: ops/D1 lands first, engine/D3 waits")
+        self.assertEqual(self.contest("--settle", "C1", "--first", "docs/D7", ok=False), "land: C1 is cancelled")
+        self.assertEqual(self.contest("--settle", "C2", "--first", "docs/D9", ok=False), "land: docs/D9 is not a holder in C2")
+        self.assertEqual(self.contest("--holders", "docs/D7,docs/D7", ok=False), "land: a contest needs two different holders")
+        self.assertEqual(self.contest("--cancel", "C9", ok=False), "land: no C9")
+
+    def test_a_contest_refuses_work_already_landed_and_ignores_a_bounce(self):
+        self.init()
+        self.queue_one(path="a.txt", name="w1", holder="docs/D7")
+        self.queue_one(path="b.txt", text="BROKEN\n", name="w2", holder="engine/D3")
+        self.land("land")
+        self.assertEqual(self.contest("--holders", "engine/D3,docs/D7", ok=False), "land: docs/D7 has E1 landed; there is nothing left to order")
+        self.assertEqual(self.contest("--holders", "engine/D3,ops/D1"), "C1")
+
+    def test_a_contest_waits_for_a_running_land_to_release_the_queue_lock(self):
+        import fcntl
+        self.init()
+        store = land.Store.for_repo(self.work)
+        with open(store.dir / ".queue.lock", "a") as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            proc = subprocess.Popen([sys.executable, str(SCRIPT), "--repo", str(self.work), "contest", "--holders", "docs/D7,engine/D3", *ADMIN],
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=os.environ.copy())
+            time.sleep(1)
+            self.assertIsNone(proc.poll())
+            self.assertEqual(self.ruling_rows("contest"), [])
+        out, err = proc.communicate(timeout=20)
+        store.db.close()
+        self.assertEqual((proc.returncode, out.strip()), (0, "C1"), err)
+
+    def test_every_ruling_write_needs_an_owner(self):
+        self.init()
+        for args in (["lease", "reserve", "--for", "docs/", "--paths", "a.txt", "--ruling", "R1"], ["lease", "unreserve", "S1"],
+                     ["share", "--for", "docs/", "1"], ["contest", "--holders", "a/D1,b/D1"], ["contest", "--cancel", "C1"]):
+            self.assertIn("--owner", self.land(*args, ok=False))
+
+    def test_paused_ruling_writes_from_a_replaced_admin_change_nothing(self):
+        self.init()
+        self.land("cap", "4")
+        self.share("docs/", 1)
+        self.contest("--holders", "docs/D7,engine/D3")
+        self.contest("--settle", "C1", "--first", "docs/D7")
+        tables = ("share", "reservation", "contest")
+        before = {table: self.ruling_rows(table) for table in tables}
+        commands = [
+            ["share", "--for", "docs/", "2", *ADMIN],
+            ["lease", "reserve", "--for", "docs/", "--paths", "a.txt", "--ruling", "R9", *ADMIN],
+            ["contest", "--settle", "C1", "--first", "engine/D3", *ADMIN],
+        ]
+        running = []
+        for number, args in enumerate(commands):
+            case = self.base / f"paused{number}"
+            case.mkdir()
+            proc = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--paused-child", str(case), "--repo", str(self.work), *args],
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=os.environ.copy())
+            running.append((case, proc))
+        for case, proc in running:
+            deadline = time.monotonic() + 20
+            while not (case / "paused").exists():
+                if proc.poll() is not None or time.monotonic() > deadline:
+                    self.fail(f"{case.name} did not pause: {proc.communicate()}")
+                time.sleep(0.01)
+        self.assertEqual(self.land("owner", "--prefix", ".admin/", "--generation", "2"), ".admin/ at generation 2")
+        for case, proc in running:
+            (case / "proceed").touch()
+            out, err = proc.communicate(timeout=30)
+            self.assertEqual((proc.returncode, err.strip()), (1, "land: owner .admin/@1 is stale; .admin/ is at generation 2"), out)
+        self.assertEqual({table: self.ruling_rows(table) for table in tables}, before)
+        current = ("--owner", ".admin/@2")
+        self.assertEqual(self.land("share", "--for", "docs/", "2", *current), "docs/ share is 2")
+        self.assertEqual(self.land("lease", "reserve", "--for", "docs/", "--paths", "a.txt", "--ruling", "R9", *current), "S1")
+        self.assertEqual(self.land("contest", "--settle", "C1", "--first", "engine/D3", *current), "C1: engine/D3 lands first, docs/D7 waits")
+        self.assertEqual(self.land("contest", "--cancel", "C1", *ADMIN, ok=False), "land: owner .admin/@1 is stale; .admin/ is at generation 2")
+
+    def test_mode_merge_after_init_in_human_mode_swaps_a_disallowed_method(self):
+        with self.fake_gh():
+            self.allow_methods(squash=True)
+            self.init(mode="human")
+            self.assertEqual(self.stored_merge_method(), "merge")
+            self.assertEqual(self.land("mode", "merge"), "landing mode is now merge, merging with --squash")
+            self.assertEqual(self.stored_merge_method(), "squash")
+            self.assertEqual(self.land("mode", "human", "--merge-method", "merge", ok=False),
+                             "land: repository does not allow merge; allowed: squash")
+            self.assertEqual(self.stored_merge_method(), "squash")
+            self.assertTrue(self.land("status").startswith("merge mode onto"))
+            self.assertEqual(self.land("mode", "human", "--merge-method", "squash"), "landing mode is now human, merging with --squash")
+
+    def test_init_in_any_mode_refuses_a_merge_method_the_repository_disallows(self):
+        with self.fake_gh():
+            self.allow_methods(squash=True)
+            self.assertEqual(self.land("init", "--trunk", "main", "--mode", "human", "--check", "./check.sh", "--merge-method", "merge", ok=False),
+                             "land: repository does not allow merge; allowed: squash")
+            self.assertIn("has no landing contract", self.land("status", ok=False))
+            self.init(mode="push", merge_method="squash")
+            self.assertEqual(self.stored_merge_method(), "squash")
+
+
+    def test_a_settled_contest_keeps_its_order_once_the_first_holders_pr_is_open(self):
+        with self.fake_gh():
+            self.init(mode="human")
+            self.queue_one(path="a.txt", name="w1", holder="docs/D7")
+            self.contest("--holders", "docs/D7,engine/D3")
+            self.queue_one(path="b.txt", name="w2", holder="engine/D3")
+            self.contest("--settle", "C1", "--first", "docs/D7")
+            self.assertEqual(self.land("land"), "opened PRs for E1 (docs/D7) https://github.com/o/r/pull/9\nstill queued: E2 (held by C1)")
+            self.assertEqual(self.contest("--settle", "C1", "--first", "engine/D3", ok=False),
+                             "land: C1 cannot put engine/D3 first: docs/D7 has E1 awaiting-merge")
+            self.assertEqual(self.contest("--settle", "C1", "--first", "docs/D7"), "C1: docs/D7 lands first, engine/D3 waits")
+
+    def test_mode_merge_checks_the_method_stored_when_it_writes(self):
+        with self.fake_gh():
+            self.allow_methods(squash=True)
+            self.init(mode="human", merge_method="squash")
+            self.pause_repo_view()
+            (self.base / "pause-repo-view").write_text("")
+            child = subprocess.Popen([sys.executable, str(SCRIPT), "--repo", str(self.work), "mode", "merge"],
+                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=os.environ.copy())
+            try:
+                deadline = time.monotonic() + 10
+                while not (self.base / "repo-view-waiting").exists():
+                    if child.poll() is not None or time.monotonic() > deadline:
+                        self.fail(f"repo view did not pause: {child.communicate()}")
+                    time.sleep(0.01)
+                (self.base / "pause-repo-view").unlink()
+                self.init(mode="human")
+                self.assertEqual(self.stored_merge_method(), "merge")
+                (self.base / "repo-view-release").write_text("")
+                out, err = child.communicate(timeout=10)
+            finally:
+                if child.poll() is None:
+                    child.kill()
+                    child.communicate()
+            self.assertEqual((child.returncode, out.strip()), (0, "landing mode is now merge, merging with --squash"), err)
+            self.assertEqual(self.stored_merge_method(), "squash")
+
+    def test_mode_local_checks_an_explicit_merge_method(self):
+        with self.fake_gh():
+            self.allow_methods(squash=True)
+            self.init(mode="local", base="main", merge_method="squash")
+            self.assertEqual(self.land("mode", "local", "--merge-method", "merge", ok=False),
+                             "land: repository does not allow merge; allowed: squash")
+            self.assertEqual(self.stored_merge_method(), "squash")
+
+    def test_a_settled_contest_keeps_its_order_while_a_failed_pr_still_has_auto_merge(self):
+        with self.fake_gh():
+            (self.base / "required-checks").write_text("")
+            (self.base / "disable-auto-fails").write_text("API unavailable")
+            self.arm_auto_merge()
+            self.init(mode="merge")
+            self.queue_one(path="a.txt", name="w1", holder="docs/D7")
+            self.contest("--holders", "docs/D7,engine/D3")
+            self.queue_one(path="b.txt", name="w2", holder="engine/D3")
+            self.contest("--settle", "C1", "--first", "docs/D7")
+            self.land("land")
+            self.land("land")
+            (self.base / "checks").write_text("failed")
+            self.assertIn("Auto-merge is still enabled: API unavailable", self.land("land"))
+            sha = self.land("status", "--holder", "docs/D7").split(", ")[1][:12]
+            self.assertEqual(self.land("submit", "--holder", "docs/D7", "--branch", "w1", "--sha", sha, "--lease", "L1", "--reviewer", REVIEWER),
+                             "E1 already awaiting-merge")
+            self.assertEqual(self.contest("--settle", "C1", "--first", "engine/D3", ok=False),
+                             "land: C1 cannot put engine/D3 first: docs/D7 has E1 awaiting-merge")
+
 if __name__ == "__main__":
+    if sys.argv[1:2] == ["--paused-child"]:
+        paused_child(sys.argv[2], sys.argv[3:])
     unittest.main()
