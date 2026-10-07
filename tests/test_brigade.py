@@ -132,6 +132,16 @@ def _race_child(mode, case, args):
             return original_locked(self)
 
         glob["Restaurant"].locked = paused_locked
+    elif mode == "pause-after-finished":
+        original_finished = glob["finished_by_coordinator"]
+
+        def paused_finished(admin):
+            finished = original_finished(admin)
+            (case / "paused").touch()
+            _wait_for_path(case / "proceed", timeout=60)
+            return finished
+
+        glob["finished_by_coordinator"] = paused_finished
     elif mode == "die-before-log":
         glob["Restaurant"].log = lambda self, *rest: os._exit(9)
     elif mode == "die-before-cursor":
@@ -2657,13 +2667,42 @@ class AdminTest(StoresTest):
         self.assertEqual(self.admin("request", "--republish"), "nothing to republish")
         self.assertEqual(self.inbox("docs"), ["A1.line"])
         self.brigade("docs", "inbox", "done", "A1")
-        # Not yet synced, so the admin publishes it again. The coordinator already finished it, so take drops it.
-        self.assertEqual(self.admin("request", "--republish"), "A1 republished for docs")
-        self.assertEqual(self.brigade("docs", "inbox", "take"), "nothing handed to you")
+        self.assertEqual(self.admin("request", "--republish"), "nothing to republish")
         self.assertEqual(self.inbox("docs"), [])
         self.admin("sync")
         self.assertEqual(self.admin("request", "--republish"), "nothing to republish")
         self.assertEqual(self.inbox("docs"), [])
+
+    def test_republish_before_sync_skips_a_request_the_coordinator_finished(self):
+        self.open("core")
+        self.open_admin()
+        self.brigade("core", "set", "--thread", "core-thread")
+        self.admin("set", "--thread", "admin-thread")
+        self.assertEqual(self.admin("request", "--to", "core", "reports-to core admin-thread"),
+                         "A1 for core; tell thread core-thread")
+        self.assertEqual(self.brigade("core", "inbox", "take"), "A1: reports-to core admin-thread")
+        self.assertEqual(self.brigade("core", "inbox", "done", "A1"), "A1 done")
+        self.assertEqual(self.admin("request", "--republish"), "nothing to republish")
+        self.assertEqual(self.inbox("core"), [])
+        self.assertNotIn("requests from the user", self.brigade("core", "status"))
+
+    def test_a_request_finished_while_republish_runs_stays_finished(self):
+        self.open("core")
+        self.open_admin()
+        self.brigade("core", "set", "--thread", "core-thread")
+        self.admin("request", "--to", "core", "reports-to core admin-thread")
+        case, proc = self.admin_child("pause-after-finished", "republish", "request", "--republish")
+        _wait_for_path(case / "paused", timeout=20)
+        self.assertEqual(self.brigade("core", "inbox", "done", "A1"), "A1 done")
+        self.assertEqual(self.inbox("core"), [])
+        (case / "proceed").touch()
+        code, out, err = self.finish(proc)
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("requests from the user", self.brigade("core", "status"))
+        self.assertEqual(self.brigade("core", "inbox", "take"), "nothing handed to you")
+        self.assertEqual(self.inbox("core"), [])
+        self.assertEqual(self.admin("request", "--republish"), "nothing to republish")
+        self.assertEqual(self.inbox("core"), [])
 
     def test_a_replayed_from_user_request_files_no_second_ticket(self):
         self.open("docs")
