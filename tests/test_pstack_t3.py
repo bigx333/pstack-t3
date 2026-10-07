@@ -1403,5 +1403,43 @@ class PreviewToolDocTest(unittest.TestCase):
             self.assertIn(name, bullet)
 
 
+class StalledChildDocTest(unittest.TestCase):
+    def test_delegation_step_5_bounds_an_open_child(self):
+        text = (ROOT / "t3/runtime.md").read_text()
+        step = text.split("5. Collect results.", 1)[1].split("6. You own every child's output.", 1)[0]
+        self.assertIn("t3_thread_wait", step)
+        self.assertIn("timeoutMs: 300000", step)
+        self.assertIn("does not end its turn while a child is open", step)
+
+    def test_permissions_never_lowers_runtime_mode(self):
+        text = (ROOT / "t3/runtime.md").read_text()
+        section = text.split("### Permissions", 1)[1].split("### Failure handling", 1)[0]
+        self.assertIn("never lower it", section)
+
+    def test_failure_handling_names_a_stalled_child(self):
+        text = (ROOT / "t3/runtime.md").read_text()
+        section = text.split("### Failure handling", 1)[1].split("### Fresh children by default", 1)[0]
+        self.assertIn("A stalled child", section)
+
+    def test_no_source_tells_a_parent_to_end_its_turn_on_an_open_child(self):
+        unbounded = re.compile(r"completion notifications? wakes?|let (?:each|the) completion|end the turn rather than wait"
+                               r"|`mode: \"async\"`,? and end the turn")
+        found = [f"{path.relative_to(ROOT)}:{number}"
+                 for path in sorted((ROOT / "t3").rglob("*.md"))
+                 for number, line in enumerate(path.read_text().splitlines(), 1) if unbounded.search(line)]
+        self.assertEqual(found, [])
+
+    def test_routed_skills_collect_children_per_delegation_step_5(self):
+        sources = {
+            "how/SKILL.md": "../pstack-runtime", "arena/SKILL.md": "../pstack-runtime",
+            "interrogate/SKILL.md": "../pstack-runtime", "swarm/SKILL.md": "../pstack-runtime",
+            "why/SKILL.md": "../pstack-runtime", "no-comments/SKILL.md": "../pstack-runtime",
+            "poteto-mode/playbooks/orchestrate.md": "../../pstack-runtime",
+        }
+        missing = [name for name, runtime in sources.items()
+                   if f"Delegation step 5]({runtime}/SKILL.md#delegation)" not in (ROOT / "t3/overrides" / name).read_text()]
+        self.assertEqual(missing, [])
+
+
 if __name__ == "__main__":
     unittest.main()
