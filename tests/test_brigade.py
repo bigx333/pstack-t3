@@ -522,7 +522,8 @@ class BrigadeTest(unittest.TestCase):
         report = f"{self.at}/reports/D1.md"
         for part in ("PURPOSE: Make startup fast.", "TICKETS: T1: Startup is slow", "branch `perf/d1`, started from `origin/main`",
                      "leased to you as L4: src/boot.ts", "- Median cold start below 400 ms", "slot --exclusive --",
-                     "TIMEBOX: 60 minutes", f"Write it to {report}", "1. Write in plain engineering prose.",
+                     "TIMEBOX: 60 minutes. The timebox orders the work and never waives a playbook step (How, Architect, investigation, or the implementation delegate). At the limit, write the report with what remains instead of skipping steps.",
+                     f"Write it to {report}", "1. Write in plain engineering prose.",
                      f'call t3_thread_send to thread thread-coord with mode "auto" and the one-line message "D1 done: report at {report}".'):
             self.assertIn(part, text)
         self.assertEqual((self.at / "briefs/D1.md").read_text().strip(), text)
@@ -561,8 +562,36 @@ class BrigadeTest(unittest.TestCase):
         self.assertEqual(self.brigade("watch"), "D1: report written 0m ago; review it even if the worker's run is still open (thread thread-9)")
         self.brigade("dish", "D1", "--state", "sent-back")
         self.brigade("dish", "D1", "--state", "in-progress")
+        self.assertEqual(self.brigade("watch"), "D1: in progress with no worker thread; launch a fresh worker")
+        self.brigade("dish", "D1", "--thread", "thread-10")
         (self.at / "reports/D1.md").write_text("second attempt")
-        self.assertEqual(self.brigade("watch"), "D1: report written, no report-back (thread thread-9)")
+        self.assertEqual(self.brigade("watch"), "D1: report written, no report-back (thread thread-10)")
+
+    def test_a_send_back_clears_the_worker_and_refuses_the_old_thread(self):
+        self.open()
+        self.fire_one()
+        self.brigade("dish", "D1", "--state", "sent-back")
+        self.assertEqual(self.brigade("dish", "D1", "--thread", "thread-8"), "D1 sent-back")
+        self.assertEqual(self.brigade("dish", "D1", "--thread", "thread-9", ok=False),
+                         "brigade: thread thread-9 is an earlier attempt of D1; a send-back launches a fresh worker")
+        self.assertEqual(self.table_row(self.at, "dishes.tsv", "D1")["thread"], "thread-8")
+        refused = self.brigade("dish", "D1", "--state", "in-progress", "--thread", "thread-9", ok=False)
+        self.assertEqual(refused, "brigade: thread thread-9 is an earlier attempt of D1; a send-back launches a fresh worker")
+        self.assertEqual(self.table_row(self.at, "dishes.tsv", "D1")["state"], "sent-back")
+        self.assertEqual(self.table_row(self.at, "dishes.tsv", "D1")["thread"], "thread-8")
+        self.assertEqual(self.brigade("dish", "D1", "--state", "in-progress", "--thread", "thread-10"), "D1 in-progress")
+        self.assertEqual(self.table_row(self.at, "dishes.tsv", "D1")["thread"], "thread-10")
+        self.brigade("dish", "D1", "--state", "sent-back")
+        self.assertEqual(self.brigade("dish", "D1", "--state", "in-progress"), "D1 in-progress")
+        self.assertEqual(self.table_row(self.at, "dishes.tsv", "D1")["thread"], "")
+        self.assertEqual(self.brigade("watch"), "D1: in progress with no worker thread; launch a fresh worker")
+        self.assertEqual(self.brigade("dish", "D1", "--thread", "thread-9", ok=False),
+                         "brigade: thread thread-9 is an earlier attempt of D1; a send-back launches a fresh worker")
+        self.assertEqual(self.brigade("dish", "D1", "--thread", "thread-10", ok=False),
+                         "brigade: thread thread-10 is an earlier attempt of D1; a send-back launches a fresh worker")
+        self.assertEqual(self.table_row(self.at, "dishes.tsv", "D1")["thread"], "")
+        self.assertEqual(self.brigade("dish", "D1", "--thread", "thread-11"), "D1 in-progress")
+        self.assertEqual(self.brigade("dish", "D1", "--thread", "thread-11"), "D1 in-progress")
 
     def test_replacing_an_in_progress_worker_starts_a_new_attempt(self):
         self.open()
@@ -585,6 +614,9 @@ class BrigadeTest(unittest.TestCase):
         self.assertEqual(self.brigade("watch"), "D1: report written 0m ago; review it even if the worker's run is still open (thread fresh-worker)")
         self.brigade("dish", "D1", "--thread", "worker-3")
         self.assertEqual(self.brigade("watch"), "D1: running 0m of 90m (thread worker-3)")
+        self.assertEqual(self.brigade("dish", "D1", "--thread", "thread-9", ok=False),
+                         "brigade: thread thread-9 is an earlier attempt of D1; a send-back launches a fresh worker")
+        self.assertEqual(self.table_row(self.at, "dishes.tsv", "D1")["thread"], "worker-3")
         report.write_text("partial from worker-3")
         self.assertEqual(self.brigade("watch"), "D1: report written, no report-back (thread worker-3)")
 
@@ -1829,7 +1861,13 @@ class BrigadeTest(unittest.TestCase):
         self.brigade("dish", "D1", "--state", "queued")
         self.land("land")
         self.assertRegex(self.brigade("watch"), r"^D1: E1 bounced: checks failed")
+        self.brigade("dish", "D1", "--thread", "worker-1")
         self.brigade("dish", "D1", "--state", "in-progress")
+        self.assertEqual(self.table_row(self.at, "dishes.tsv", "D1")["thread"], "")
+        self.assertIn("D1: in progress with no worker thread; launch a fresh worker", self.brigade("watch"))
+        self.assertEqual(self.brigade("dish", "D1", "--thread", "worker-1", ok=False),
+                         "brigade: thread worker-1 is an earlier attempt of D1; a send-back launches a fresh worker")
+        self.brigade("dish", "D1", "--thread", "worker-2")
         new = self.worker_commit("perf/d1", {"BROKEN": None})
         self.passed(new)
         self.assertEqual(self.submit(new), "E2")
