@@ -44,6 +44,7 @@ CREATE TABLE IF NOT EXISTS attempt (
   id INTEGER PRIMARY KEY, at TEXT NOT NULL, base TEXT NOT NULL, candidate TEXT NOT NULL,
   entries TEXT NOT NULL, state TEXT NOT NULL CHECK (state IN ('publishing', 'published', 'abandoned')));
 CREATE TABLE IF NOT EXISTS log (at TEXT NOT NULL, kind TEXT NOT NULL, id INTEGER NOT NULL, state TEXT NOT NULL, note TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS owner (prefix TEXT PRIMARY KEY, generation INTEGER NOT NULL);
 """
 
 
@@ -402,9 +403,46 @@ def wanted_paths(paths):
     return sorted({canonical(p) for p in paths.split(",")})
 
 
-def lease_claim(store, holder, paths, ttl_hours):
+def parse_owner(text):
+    match = re.fullmatch(r"(.+/)@(\d+)", text or "")
+    if not match:
+        raise LandError(f"{text!r} is not an owner such as docs/@2")
+    return match.group(1), int(match.group(2))
+
+
+def check_owner(db, holder, owner):
+    """Refuse a write by a replaced coordinator. Run it inside the write's transaction."""
+    if owner is not None:
+        prefix, generation = parse_owner(owner)
+        if not holder.startswith(prefix):
+            raise LandError(f"owner {owner} does not cover holder {holder}")
+    for row in db.execute("SELECT * FROM owner ORDER BY prefix"):
+        if not holder.startswith(row["prefix"]):
+            continue
+        if owner is None or prefix != row["prefix"]:
+            raise LandError(f"{holder} is under {row['prefix']} at generation {row['generation']}; "
+                            f"pass --owner {row['prefix']}@{row['generation']}")
+        if generation < row["generation"]:
+            raise LandError(f"owner {owner} is stale; {prefix} is at generation {row['generation']}")
+
+
+def raise_floor(store, prefix, generation):
+    if not prefix.endswith("/"):
+        raise LandError(f"{prefix!r} is not a holder prefix such as docs/")
+    with store.tx() as db:
+        row = db.execute("SELECT generation FROM owner WHERE prefix = ?", (prefix,)).fetchone()
+        if row and row["generation"] > generation:
+            raise LandError(f"{prefix} is at generation {row['generation']}; a floor never lowers")
+        if not row or row["generation"] < generation:
+            db.execute("INSERT OR REPLACE INTO owner VALUES (?, ?)", (prefix, generation))
+            store.log(db, "owner", generation, "raised", prefix)
+    return f"{prefix} at generation {generation}"
+
+
+def lease_claim(store, holder, paths, ttl_hours, owner=None):
     wanted = wanted_paths(paths)
     with store.tx() as db:
+        check_owner(db, holder, owner)
         clash, full = admission(store, db, holder, wanted)
         if clash:
             raise LandError("paths overlap " + "; ".join(held_on(row) for row in clash))
@@ -423,12 +461,13 @@ def lease_check(store, holder, paths):
     return "free", 0
 
 
-def lease_renew(store, number, ttl_hours, if_live):
+def lease_renew(store, number, ttl_hours, if_live, owner=None):
     """Extend a live lease. An expired lease is admitted again, as a new claim on its paths would be."""
     with store.tx() as db:
         row = db.execute("SELECT * FROM lease WHERE id = ?", (number,)).fetchone()
         if not row:
             raise LandError(f"no L{number}")
+        check_owner(db, row["holder"], owner)
         if row["state"] == "submitted":
             raise LandError(f"L{number} is submitted; the queue holds it")
         if row["state"] == "released":
@@ -448,6 +487,18 @@ def lease_renew(store, number, ttl_hours, if_live):
     return f"L{number} renewed"
 
 
+def lease_release(store, number, owner=None):
+    with store.tx() as db:
+        row = db.execute("SELECT * FROM lease WHERE id = ?", (number,)).fetchone()
+        if row:
+            check_owner(db, row["holder"], owner)
+        if not row or row["state"] != "active":
+            raise LandError(f"L{number} is not active; a submitted lease is released when its entry lands or bounces")
+        db.execute("UPDATE lease SET state = 'released' WHERE id = ?", (number,))
+        store.log(db, "lease", number, "released")
+    return f"L{number} released"
+
+
 def lease_id(text):
     if not re.fullmatch(r"L?\d+", text or ""):
         raise LandError(f"{text!r} is not a lease id such as L3")
@@ -465,7 +516,7 @@ def entry_id(text):
     return int(text.lstrip("EQ"))
 
 
-def submit(store, holder, branch, sha, lease, reviewer, title="", body=""):
+def submit(store, holder, branch, sha, lease, reviewer, title="", body="", owner=None):
     contract, repo = store.contract, store.repo
     lease_number = lease_id(lease)
     sha = git("rev-parse", "--verify", f"{sha}^{{commit}}", cwd=repo).stdout.strip()
@@ -480,6 +531,7 @@ def submit(store, holder, branch, sha, lease, reviewer, title="", body=""):
     print_ = fingerprint(repo, base, sha)
     git("update-ref", pin_ref(sha), sha, cwd=repo)
     with store.tx() as db:
+        check_owner(db, holder, owner)
         existing = db.execute("SELECT id, state FROM entry WHERE sha = ? AND holder = ?", (sha, holder)).fetchone()
         if existing and existing["state"] != "bounced":
             return f"{entry_label(existing['id'])} already {existing['state']}"
@@ -1280,11 +1332,17 @@ def report(store, landed, bounced, opened, adopted=()):
     return "\n".join(lines) or "nothing to land"
 
 
-def holder_status(store, holder):
-    """Entries of one holder, or of every holder under a prefix that ends in /."""
+def holder_status(store, holder, sha=None):
+    """Entries of one holder, or of every holder under a prefix that ends in /, optionally only those at one commit."""
+    if sha:
+        # submit stores the full SHA rev-parse gives, so a short or uppercase SHA compares the same way.
+        resolved = git("rev-parse", "--verify", "--quiet", f"{sha}^{{commit}}", cwd=store.repo, check=False)
+        sha = resolved.stdout.strip() if resolved.returncode == 0 else sha.lower()
     lines = []
     for row in store.db.execute("SELECT * FROM entry ORDER BY id"):
         if row["holder"] != holder and not (holder.endswith("/") and row["holder"].startswith(holder)):
+            continue
+        if sha and row["sha"] != sha:
             continue
         line = f"{entry_label(row['id'])} {row['state']} ({row['holder']}, {row['sha'][:12]})"
         if row["state"] == "landed" and row["landed"]:
@@ -1294,7 +1352,7 @@ def holder_status(store, holder):
         elif row["state"] == "bounced":
             line += f": {row['note']}"
         lines.append(line)
-    return "\n".join(lines) or f"no entries held by {holder}"
+    return "\n".join(lines) or f"no entries held by {holder}" + (f" at {sha}" if sha else "")
 
 
 def status(store, ident=None):
@@ -1340,18 +1398,26 @@ def parser():
     p.add_argument("mode", choices=MODES + tuple(LEGACY_MODES))
     p.add_argument("--merge-method", choices=MERGE_METHODS)
 
+    owner_help = "<holder prefix>@<generation> of the coordinator writing; refused below that prefix's floor"
+    p = sub.add_parser("owner", help="raise a holder prefix's generation floor; it never lowers")
+    p.add_argument("--prefix", required=True, help="a holder prefix ending in /, such as docs/")
+    p.add_argument("--generation", type=int, required=True)
+
     p = sub.add_parser("lease", help="claim, renew, release, or list path leases")
     t = p.add_subparsers(dest="action", required=True)
     a = t.add_parser("claim")
     a.add_argument("--holder", required=True)
     a.add_argument("--paths", required=True, help="comma-separated files or directories; . is the whole repository")
     a.add_argument("--ttl-hours", type=float, default=6)
+    a.add_argument("--owner", help=owner_help)
     a = t.add_parser("renew")
     a.add_argument("id")
     a.add_argument("--ttl-hours", type=float, default=6)
     a.add_argument("--if-live", action="store_true", help="refuse when the lease has expired instead of admitting it again")
+    a.add_argument("--owner", help=owner_help)
     a = t.add_parser("release")
     a.add_argument("id")
+    a.add_argument("--owner", help=owner_help)
     t.add_parser("list")
     a = t.add_parser("check", help="run the claim's admission test without claiming")
     a.add_argument("--holder", required=True)
@@ -1365,12 +1431,14 @@ def parser():
     p.add_argument("--reviewer", required=True, help="provider/model of the reviewer that passed this SHA")
     p.add_argument("--title", default="", help="human mode: the PR title (default: the last commit subject)")
     p.add_argument("--body-file", default="", help="human mode: a file holding the PR body")
+    p.add_argument("--owner", help=owner_help)
 
     sub.add_parser("land", help="drain the queue unless another run holds it")
     sub.add_parser("resume", help="clear a pause after you checked trunk")
     p = sub.add_parser("status")
     p.add_argument("id", nargs="?")
     p.add_argument("--holder", help="list this holder's entries; a value ending in / matches every holder under it")
+    p.add_argument("--sha", help="with --holder, only entries at exactly this commit")
     p = sub.add_parser("slot", help="run a heavy command under a governor slot")
     p.add_argument("--exclusive", action="store_true", help="hold every slot: for benchmarks that need a quiet machine")
     p.add_argument("cmd", nargs=argparse.REMAINDER)
@@ -1391,28 +1459,24 @@ def run(argv):
     store = Store.for_repo(args.repo)
     if args.command == "cap":
         return change_cap(store, args.count), 0
+    if args.command == "owner":
+        return raise_floor(store, args.prefix, args.generation), 0
     if args.command == "lease":
         if args.action == "claim":
-            return lease_claim(store, args.holder, args.paths, args.ttl_hours), 0
+            return lease_claim(store, args.holder, args.paths, args.ttl_hours, args.owner), 0
         if args.action == "check":
             return lease_check(store, args.holder, args.paths)
         if args.action == "list":
             return "\n".join(f"L{r['id']} {r['state']} {r['holder']} until {r['expires'][:16]}: {lease_paths(r)}" for r in in_flight(store.db)) or "no leases held", 0
         number = lease_id(args.id)
         if args.action == "renew":
-            return lease_renew(store, number, args.ttl_hours, args.if_live), 0
-        with store.tx() as db:
-            row = db.execute("SELECT state FROM lease WHERE id = ?", (number,)).fetchone()
-            if not row or row["state"] != "active":
-                raise LandError(f"L{number} is not active; a submitted lease is released when its entry lands or bounces")
-            db.execute("UPDATE lease SET state = 'released' WHERE id = ?", (number,))
-            store.log(db, "lease", number, "released")
-        return f"L{number} released", 0
+            return lease_renew(store, number, args.ttl_hours, args.if_live, args.owner), 0
+        return lease_release(store, number, args.owner), 0
     if args.command == "mode":
         return change_mode(store, args.mode, args.merge_method), 0
     if args.command == "submit":
         body = Path(args.body_file).read_text() if args.body_file else ""
-        return submit(store, args.holder, args.branch, args.sha, args.lease, args.reviewer, args.title, body), 0
+        return submit(store, args.holder, args.branch, args.sha, args.lease, args.reviewer, args.title, body, args.owner), 0
     if args.command == "land":
         return land(store), 0
     if args.command == "resume":
@@ -1424,7 +1488,9 @@ def run(argv):
     if args.holder:
         if args.id:
             raise LandError("status takes an entry id or --holder, not both")
-        return holder_status(store, args.holder), 0
+        return holder_status(store, args.holder, args.sha), 0
+    if args.sha:
+        raise LandError("status --sha needs --holder")
     return status(store, args.id), 0
 
 
