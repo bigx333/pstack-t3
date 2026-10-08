@@ -9,6 +9,8 @@ Read [the pstack-t3 runtime](../pstack-runtime/SKILL.md) before spawning workers
 
 Fan out N parallel child tasks. They may cover separate slices, race the same brief, or mix both. The parent waits, aggregates, and returns one report.
 
+[The runtime's Modes section](../pstack-runtime/SKILL.md#modes) sets the mode lines of every brief this skill writes and how its spawns run in light mode.
+
 ## Start
 
 Open a todolist with one entry per phase before launching anything.
@@ -41,7 +43,7 @@ Spawn all N workers in one message, one `delegate_task` call per worker, with `m
 
 When a worker must start from a non-default branch, name that branch in the brief as the worktree's base. Uncommitted changes do not reach a new worktree, so commit or push first.
 
-Every brief stands alone. Include the goal, scope, exact slice or race arm, how to verify, and what to report. A worker that only reads gets a read-only brief that says "do not edit files, commit, or push." A worker that writes code for a poteto-mode playbook also follows step 4 of [the runtime's Delegation section](../pstack-runtime/SKILL.md#delegation): the poteto-agent persona first, the playbook's `Playbook: playbooks/<name>.md` line, and `roles.py check-brief` before `delegate_task`. Reports use `PASS`, `ISSUES`, or `BLOCKED` with evidence. A worker that can prove a defect reports `ISSUES` and lists every issue it can prove, not only the first.
+Every brief stands alone. Include the goal, scope, exact slice or race arm, how to verify, and what to report. A worker that only reads gets a read-only brief that says "do not edit files, commit, or push." A worker that writes code for a poteto-mode playbook also follows step 4 of [the runtime's Delegation section](../pstack-runtime/SKILL.md#delegation): the poteto-agent persona first, the lines `roles.py mode --playbook <name> --attempt <kind>` prints for the playbook it serves, which start with `Playbook: playbooks/<name>.md`, and `roles.py check-brief` before `delegate_task`. Reports use `PASS`, `ISSUES`, or `BLOCKED` with evidence. A worker that can prove a defect reports `ISSUES` and lists every issue it can prove, not only the first.
 
 If a worker drops out, proceed with N-1 and note it.
 

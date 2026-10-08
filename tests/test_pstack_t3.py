@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 
@@ -1006,12 +1007,277 @@ class CodeDelegateBriefTest(unittest.TestCase):
             lines = (ROOT / "skills" / path).read_text().splitlines()
             matches = [line for line in lines if line.startswith(step)]
             self.assertEqual(len(matches), 1, (path, step))
-            for needed in ("pstack-runtime/SKILL.md#delegation)", "poteto-agent persona first", playbook_line, "`roles.py check-brief` before `delegate_task`"):
+            for needed in ("pstack-runtime/SKILL.md#delegation)", "poteto-agent persona first", playbook_line, "`roles.py mode --playbook ", "`roles.py check-brief` before `delegate_task`"):
                 self.assertIn(needed, matches[0], path)
 
     def test_routed_skill_exception_excludes_code_writing_children(self):
         text = (ROOT / "skills/poteto-mode/SKILL.md").read_text()
         self.assertIn("It never covers a code-writing child.", text)
+
+
+MODE_POINTER_SITES = {
+    **{f"{name}/SKILL.md": "skill" for name in (
+        "poteto-mode", "how", "why", "architect", "arena", "no-comments", "swarm", "interrogate",
+        "show-me-your-work", "recall", "automate-me", "maintain-verification-skill", "reflect",
+        "pstack-author-skill", "landing",
+    )},
+    **{f"poteto-mode/playbooks/{stem}.md": "playbook" for stem in (
+        "feature", "bug-fix", "refactoring", "perf-issue", "hillclimb", "opening-a-pr",
+        "autopilot-full", "autopilot-stack", "multi-phase-plan", "orchestrate", "shipping",
+        "visual-parity", "worktree-cleanup",
+    )},
+}
+MODES_UNCHANGED = {
+    "pstack-runtime/SKILL.md": "the Modes section's home",
+    "brigade/SKILL.md": "brigade's mode lands in its own change",
+    "setup-pstack/SKILL.md": "the smoke test is kept, one per provider",
+    "poteto-help/SKILL.md": "names delegate_task to explain the persona and spawns nothing",
+    "poteto-mode/playbooks/autonomous-run.md": "the watcher is kept",
+    "poteto-mode/playbooks/eval.md": "keeps arena and its judge, because comparing candidates is its purpose",
+}
+SPAWNS = re.compile(r"delegate_task|t3_thread_launch|create_threads")
+RUNTIME_LINK = re.compile(r"pstack-runtime/SKILL\.md#([^)\s]+)\)")
+
+
+def pointer_sentence(kind):
+    rel = "../pstack-runtime/SKILL.md" if kind == "skill" else "../../pstack-runtime/SKILL.md"
+    return (
+        f"[The runtime's Modes section]({rel}#modes) sets the mode lines of every brief "
+        f"this {kind} writes and how its spawns run in light mode."
+    )
+
+
+def unfenced_lines(text):
+    fenced = False
+    for line in text.splitlines():
+        if line.lstrip().startswith("```"):
+            fenced = not fenced
+            continue
+        if not fenced:
+            yield line
+
+
+def heading_slug(heading):
+    kept = "".join(char for char in heading.lower() if char.isalnum() or char in " -")
+    return kept.replace(" ", "-")
+
+
+GATE_CONTRACT = """\
+Gate review contract. These rules override the persona above and the tasks below where they differ.
+Do not edit files, commit, or push. Do not post on the PR. Return your report to the parent.
+Launch no child task, thread, or subagent. Do not run the how, why, architect, or interrogate skill. Do not launch show-me-your-work's trail reviewer.
+Read the whole diff and the nearby code yourself. You may run git log -L and git blame. Run the named verification commands yourself.
+When a claim or finding needs investigation beyond those reads, return send-back. Name the file, the line, the claim, and the question the fix must answer.
+Report each comment the persona would delete as a send-back finding with its path and line. Make no edit.
+End with pass, send-back, or blocked, the full head SHA, the author, and the verifier.
+"""
+
+SEAT_RULE = """\
+Seat rule. Copy the Mode value above into --brief-mode on every roles.py mode and roles.py show call you make, and pass no other mode flag. Never pass --session-mode. Mode source names where your launcher's decision came from. It does not make this thread a session.
+"""
+
+
+def gate_contract(runtime):
+    start = runtime.index("2. **Brief.**")
+    window = runtime[start:].split("\n3. **Verdict.**", 1)[0]
+    lines = window.splitlines()
+    open_at = next(i for i, line in enumerate(lines) if line.strip() == "```text")
+    close_at = next(i for i, line in enumerate(lines) if i > open_at and line.strip() == "```")
+    body = "\n".join(lines[open_at + 1:close_at]) + "\n"
+    return textwrap.dedent(body)
+
+
+def seat_rule(runtime):
+    start = runtime.index("is not a code delegate")
+    window = runtime[start:].split("\n- A read-only leaf", 1)[0]
+    lines = window.splitlines()
+    open_at = next(i for i, line in enumerate(lines) if line.strip() == "```text")
+    close_at = next(i for i, line in enumerate(lines) if i > open_at and line.strip() == "```")
+    body = "\n".join(lines[open_at + 1:close_at]) + "\n"
+    return textwrap.dedent(body)
+
+
+def brief_paragraph(runtime):
+    start = runtime.index("2. **Brief.**")
+    window = runtime[start:].split("\n3. **Verdict.**", 1)[0]
+    prose = []
+    for line in window.splitlines():
+        if line.strip().startswith("```"):
+            break
+        if prose and not line.strip():
+            break
+        if line.strip():
+            prose.append(line.strip())
+    return " ".join(prose)
+
+
+def light_behavior_rows(runtime):
+    section = runtime.split("### Light behavior", 1)[1].split("\n### ", 1)[0]
+    rows = []
+    for line in section.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("|"):
+            if rows:
+                break
+            continue
+        if not stripped.replace("|", "").replace(":", "").replace("-", "").strip():
+            continue
+        if stripped.strip("|").split("|", 1)[0].strip() == "Spawn":
+            continue
+        rows.append(stripped)
+    return rows
+
+
+def light_row(runtime, spawn):
+    matches = [row for row in light_behavior_rows(runtime) if row.split("|", 2)[1].strip() == spawn]
+    if len(matches) != 1:
+        raise AssertionError(f"{spawn}: expected 1 light row, found {len(matches)}")
+    return matches[0]
+
+
+class ModesTest(unittest.TestCase):
+    def setUp(self):
+        self.runtime = (ROOT / "skills/pstack-runtime/SKILL.md").read_text()
+
+    def test_every_pointer_site_holds_the_pointer_once_outside_a_fence(self):
+        for path, kind in MODE_POINTER_SITES.items():
+            text = (ROOT / "skills" / path).read_text()
+            sentence = pointer_sentence(kind)
+            with self.subTest(path=path):
+                self.assertEqual(text.count(sentence), 1)
+                self.assertIn(sentence, list(unfenced_lines(text)))
+
+    def test_every_spawning_file_points_at_modes_or_says_why_not(self):
+        skills = ROOT / "skills"
+        spawning = sorted(
+            str(path.relative_to(skills))
+            for path in [*skills.glob("*/SKILL.md"), *skills.glob("poteto-mode/playbooks/*.md")]
+            if SPAWNS.search(path.read_text())
+        )
+        self.assertEqual([path for path in spawning if path not in MODE_POINTER_SITES and path not in MODES_UNCHANGED], [])
+        self.assertEqual([path for path in MODES_UNCHANGED if not (skills / path).is_file()], [])
+        self.assertEqual(set(MODE_POINTER_SITES) & set(MODES_UNCHANGED), set())
+
+    def test_every_runtime_link_names_a_runtime_heading(self):
+        slugs = {heading_slug(line.lstrip("#").strip()) for line in unfenced_lines(self.runtime) if line.startswith("#")}
+        broken = []
+        for path in sorted((ROOT / "skills").rglob("*.md")):
+            for fragment in RUNTIME_LINK.findall(path.read_text()):
+                if fragment not in slugs:
+                    broken.append(f"{path.relative_to(ROOT)}#{fragment}")
+        for fragment in re.findall(r"\]\(#([^)\s]+)\)", self.runtime):
+            if fragment not in slugs:
+                broken.append(f"pstack-runtime/SKILL.md#{fragment}")
+        self.assertEqual(broken, [])
+        self.assertEqual(heading_slug("Resolve and carry the mode"), "resolve-and-carry-the-mode")
+
+    def test_runtime_has_one_modes_section_between_roles_and_isolation(self):
+        headings = [line for line in unfenced_lines(self.runtime) if line.startswith("## ") or line.startswith("### ")]
+        self.assertEqual(headings.count("## Modes"), 1)
+        modes = headings.index("## Modes")
+        self.assertLess(headings.index("## Roles"), modes)
+        isolation = headings.index("## Isolation")
+        self.assertEqual(headings[modes + 1:isolation], [
+            "### Resolve and carry the mode",
+            "### Light behavior",
+            "### Never cut",
+            "### Gate review",
+            "### Announcement",
+        ])
+        self.assertNotIn("pass check", self.runtime)
+
+    def test_deadlines_and_delegation_step_4_carry_the_mode_lines(self):
+        deadlines = self.runtime.split("## Deadlines", 1)[1].split("\n## ", 1)[0]
+        self.assertIn(
+            "A step that the brief's `Waived by mode:` line names is not a skip, "
+            "because the mode removed it before the attempt started.",
+            deadlines,
+        )
+        step = next(line for line in self.runtime.splitlines() if line.startswith("4. A child starts with only its brief."))
+        for needed in ("roles.py mode --cwd", "Write no `Playbook:` line of your own", "--brief-mode"):
+            self.assertIn(needed, step)
+
+    def test_opening_a_pr_gates_light_prs_before_the_forge(self):
+        text = (ROOT / "skills/poteto-mode/playbooks/opening-a-pr.md").read_text()
+        blocks = text.split("\n\n")
+        lead = [block.split(" ", 1)[0] for block in blocks]
+        self.assertLess(lead.index("**Descriptions.**"), lead.index("**Gate.**"))
+        self.assertLess(lead.index("**Gate.**"), lead.index("**Forge.**"))
+        self.assertIn("(../../pstack-runtime/SKILL.md#gate-review)", blocks[lead.index("**Gate.**")])
+        child = next(block for block in blocks if block.startswith("A child task that opens a PR"))
+        self.assertIn("that child runs the **Gate** paragraph above in place of `interrogate` and `/no-comments`.", child)
+        self.assertIn("Run `/no-comments` before review.", text)
+
+    def test_gate_contract_is_literal(self):
+        self.assertEqual(gate_contract(self.runtime), GATE_CONTRACT)
+
+    def test_seat_rule_is_literal(self):
+        self.assertEqual(seat_rule(self.runtime), SEAT_RULE)
+
+    def test_every_owner_row_carries_the_seat_rule(self):
+        rows = [row for row in light_behavior_rows(self.runtime) if "mode lines" in row]
+        self.assertGreaterEqual(len(rows), 4)
+        for row in rows:
+            self.assertIn(
+                "the seat rule from [Resolve and carry the mode](#resolve-and-carry-the-mode)",
+                row,
+            )
+
+    def test_child_facing_light_rows(self):
+        self.assertIn(
+            "Its brief lists every `threadId` that `t3_thread_list` returns in the window, across every page. The parent filters and samples none",
+            light_row(self.runtime, "`automate-me`"),
+        )
+        self.assertIn("pass `--session-mode full`", light_row(self.runtime, "`reflect`"))
+        verification = light_row(self.runtime, "Multi-phase verification")
+        self.assertIn("every **Verify, live** lane box that drives its surface", verification)
+        self.assertIn("Launch no perf lane.", verification)
+        self.assertIn("(#gate-review)", verification)
+
+    def test_explicit_reflect_names_session_full_at_both_flag_sites(self):
+        roles = self.runtime.split("### Where roles live", 1)[1].split("\n### ", 1)[0]
+        paragraph = next(block for block in roles.split("\n\n") if block.startswith("When the brief this call seats"))
+        self.assertIn(
+            "except for a user's explicit reflect, which passes `--session-mode full`",
+            paragraph,
+        )
+        resolve = self.runtime.split("### Resolve and carry the mode", 1)[1].split("\n### ", 1)[0]
+        self.assertIn("except the explicit reflect below", resolve)
+        self.assertIn(
+            "A user's explicit reflect passes `--session-mode full` on every `roles.py show` call",
+            resolve,
+        )
+
+    def test_automate_me_brief_lists_every_assigned_thread(self):
+        text = (ROOT / "skills/automate-me/SKILL.md").read_text()
+        self.assertIn("brief lists every `threadId` in its assignment", text)
+        self.assertIn("An assignment is never a sample or a pick of the relevant threads.", text)
+        self.assertNotIn("gets its slice", text)
+
+    def test_autopilot_owner_message_carries_the_seat_rule(self):
+        text = (ROOT / "skills/poteto-mode/playbooks/autopilot-full.md").read_text()
+        self.assertIn(
+            "Each owner `message`, including a replacement's, carries the mode lines and the seat rule "
+            "from [Resolve and carry the mode](../../pstack-runtime/SKILL.md#resolve-and-carry-the-mode).",
+            text,
+        )
+
+    def test_gate_brief_pastes_persona_then_contract(self):
+        paragraph = brief_paragraph(self.runtime)
+        self.assertIn("Paste the body of `agents/comment-sicko.md` unchanged", paragraph)
+        self.assertIn("paste the gate contract below unchanged", paragraph)
+        self.assertNotIn("and ask for that skill's checks", self.runtime)
+
+    def test_every_gate_review_row_links_gate_review(self):
+        for row in light_behavior_rows(self.runtime):
+            if "gate review" not in row and "is the gate" not in row:
+                continue
+            spawn = row.split("|")[1].strip()
+            self.assertIn("(#gate-review)", row, spawn)
+
+    def test_full_mode_persona_keeps_investigation(self):
+        persona = (ROOT / "skills/pstack-runtime/agents/comment-sicko.md").read_text()
+        self.assertIn("I run the **how** skill, the **why** skill, or both", persona)
 
 
 class BuildTest(unittest.TestCase):
@@ -1186,6 +1452,76 @@ class BuildTest(unittest.TestCase):
             "demo/SKILL.md:11: catalog heredoc closer JSON has trailing whitespace. The closer is JSON with nothing after it",
             "demo/SKILL.md:12: catalog heredoc closer JSON is indented. Put JSON at column 0",
         ])
+
+    def light_findings(self, rel, body):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / rel
+            path.parent.mkdir(parents=True)
+            name = rel.split("/", 1)[0]
+            path.write_text(f"---\nname: {name}\ndescription: d\n---\n\n{body}\n" if rel.endswith("SKILL.md") else body)
+            return [finding for finding in check.check_tree(directory) if "light" in finding]
+
+    def test_check_rejects_a_pasted_waiver_table(self):
+        header = "| Playbook | `first` | `fix` and `bounce` |"
+        findings = self.light_findings("demo/SKILL.md", "\n".join([
+            header,
+            "| --- | --- | --- |",
+            "| Feature | Arena, Interrogate, Comment Sicko | How, Architect, Arena, Interrogate, Comment Sicko |",
+        ]))
+        self.assertIn(
+            f"demo/SKILL.md:6: light table restated. Link pstack-runtime/SKILL.md#modes instead of pasting it: {header}",
+            findings,
+        )
+
+    def test_check_rejects_a_census_with_a_light_column(self):
+        header = "| Census row | Full | Light | Kind |"
+        findings = self.light_findings("demo/SKILL.md", f"{header}\n| --- | --- | --- | --- |")
+        self.assertEqual(findings, [
+            f"demo/SKILL.md:6: light table restated. Link pstack-runtime/SKILL.md#modes instead of pasting it: {header}",
+        ])
+
+    def test_check_rejects_light_mode_prose_without_the_runtime_link(self):
+        findings = self.light_findings("demo/SKILL.md", "In light mode, launch at most 3 workers.")
+        self.assertEqual(findings, [
+            "demo/SKILL.md:6: names light mode without a link to the runtime's Modes section. "
+            "Link pstack-runtime/SKILL.md#modes: In light mode, launch at most 3 workers.",
+        ])
+
+    def test_check_accepts_the_modes_pointer(self):
+        pointer = (
+            "[The runtime's Modes section](../pstack-runtime/SKILL.md#modes) sets the mode lines "
+            "of every brief this skill writes and how its spawns run in light mode."
+        )
+        self.assertEqual(self.light_findings("demo/SKILL.md", pointer), [])
+
+    def test_check_lets_the_runtime_hold_the_light_table(self):
+        body = "\n".join([
+            "Call `watch_pull_request`. Call `unwatch_pull_request`.",
+            "",
+            "| Spawn | Light behavior |",
+            "| --- | --- |",
+            "| Feature | Arena, Interrogate, Comment Sicko |",
+            "",
+            "In light mode, launch at most 3 workers.",
+        ])
+        with tempfile.TemporaryDirectory() as directory:
+            skill = Path(directory) / "pstack-runtime"
+            skill.mkdir()
+            (skill / "SKILL.md").write_text(f"---\nname: pstack-runtime\ndescription: d\n---\n\n{body}\n")
+            self.assertEqual(check.check_tree(directory), [])
+
+    def test_check_ignores_waiver_names_outside_markdown(self):
+        findings = self.light_findings("demo/scripts/x.py", 'ROW = ("Arena", "Interrogate", "Comment Sicko")\n')
+        self.assertEqual(findings, [])
+
+    def test_check_accepts_an_unrelated_playbook_table(self):
+        with tempfile.TemporaryDirectory() as directory:
+            skill = Path(directory) / "demo"
+            skill.mkdir()
+            (skill / "SKILL.md").write_text(
+                "---\nname: demo\ndescription: d\n---\n\n| Playbook | Purpose |\n| --- | --- |\n| Feature | New behavior |\n"
+            )
+            self.assertEqual(check.check_tree(directory), [])
 
 
 def fragment_name(branch):
