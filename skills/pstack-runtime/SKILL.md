@@ -96,7 +96,7 @@ Print the merged roles for the current project with:
 python3 <pstack-runtime>/scripts/roles.py show --cwd "$PWD" --parent "<inheritedProviderInstanceId>/<inheritedModel>"
 ```
 
-Pass `--parent` with the values from `orchestrator_capabilities`. The saved catalog records whichever thread ran setup, so without `--parent` the verifier panel treats no seat as this thread's own.
+Always pass `--parent` with the values from `orchestrator_capabilities`. The saved catalog records whichever thread ran setup, so it never names this thread. Without `--parent`, the verifier panel treats no seat as this thread's own, and `show` cannot refuse an `inherit` seat on a thread that runs a capped model. `show`, `validate`, and `write` reject a malformed `--parent`. See [Prompt caps](#prompt-caps).
 
 `<pstack-runtime>` is the directory holding this file. It sits next to every other pstack skill directory, so from a skill at `<dir>/swarm/SKILL.md` it is `<dir>/pstack-runtime`. Add `--role "<name>"` for one role. The output is small JSON with `source` per role. It resolves against the catalog snapshot that `setup-pstack` saved, if any. A role that reports `"seats": "catalog-required"`, or an adaptive panel that reports `"seats": "default-panel"`, needs a catalog. Call `orchestrator_capabilities`. Paste that tool result into this quoted heredoc. If the catalog result is large, save it to a temporary file with the host's file tool and pass that path to `--catalog`.
 
@@ -138,7 +138,7 @@ Do not reconstruct role defaults in the calling skill. Pass a file path to `--ca
 
 Code roles (`feature, refactoring`, `bug-fix`, `perf-issue`, `hillclimb`, `swarm workers`, `how explorer`, `why investigators`, `reflect tooling`) use `grok-4.7` at xhigh. Judgment roles (`judgment and prose`, `hardest tasks`, `how explainer`, `why synthesizer`, `reflect judgment, divergent, synthesizer`) use `claude-opus-5-5` at xhigh. `arena runners`, `arena cross-judge pool`, `architect runners`, and `interrogate reviewers` use those two seats in that order. A Grok seat sets `fastMode` only when the chosen model is in the grok family and declares that boolean option. A fallback to another family does not set it.
 
-`skill tests` is one catalog seat. Prefer a runnable model whose family differs from this thread's model. A family is the leading word of the model id. In that pool, prefer an id token in `haiku`, `mini`, `nano`, `flash`, `lite`, `fast`, `small`, or `luna`, then the lowest default reasoning level, then earlier in the catalog. If every runnable model shares this thread's family, apply the same rule inside the family. No catalog, or no runnable model, leaves `["inherit"]`. The seat names no reasoning option. The budget cap still applies.
+`skill tests` is one catalog seat. Prefer a runnable model whose family differs from this thread's model. A family is the leading word of the model id. In that pool, prefer an id token in `haiku`, `mini`, `nano`, `flash`, `lite`, `fast`, `small`, or `luna`, then the lowest default reasoning level, then earlier in the catalog. That ranking picks a model line, the model id without its version numbers, so `claude-haiku-4-5` and `claude-haiku-5-5` share one line. The seat is the newest version of that line on any runnable provider. Ties among those rows break in the same order: another family, a small-tier token, the lower default reasoning level, then earlier in the catalog. `show` skips capped models here, so Haiku 5.5 reaches a test only through `roles.py bounded-seat`, per [Prompt caps](#prompt-caps). If every runnable model shares this thread's family, apply the same rule inside the family. No catalog, or no runnable model, leaves `["inherit"]`. When this thread runs a capped model, no catalog gives `catalog-required` instead. The seat names no reasoning option. The budget cap still applies.
 
 `verifiers` starts with `"inherit"` when this thread's provider can run children, then adds one seat per other runnable provider (`canRunChildTask: true`), using that provider's first listed model and skipping a family already seated. With only one runnable provider, `verifiers` is three `"inherit"` seats, and the report must say the models did not differ. The other panel roles do not use that three-seat rule.
 
@@ -167,6 +167,24 @@ A configured seat whose provider is not runnable, or whose model is not in the c
 Built-in preferred seats use the numbered notes from [Built-in defaults](#built-in-defaults). Those notes name each replacement, and the panel size never shrinks.
 
 `roles.py validate --catalog <file>` checks a config against a saved catalog file. Use the file path there. The quoted heredoc above is for `show` when the catalog is still a tool result.
+
+### Prompt caps
+
+Claude Haiku 5.5 (`claude-haiku-5-5`, on any provider) should not receive a prompt over 100,000 tokens, because its price rises fivefold past that. `PROMPT_CAPS` in `roles.py` holds that target. T3 records no token counts, so the parent estimates the prompt before launch and runs Haiku 5.5 only on a short leaf task whose estimate is at or under the target.
+
+- `roles.py show` never returns a capped model. A capped `skill tests` seat, configured or adaptive, comes back as the adaptive `skill tests` seat from [Built-in defaults](#built-in-defaults) with capped models skipped, which can be another model line, with the note `claude-haiku-5-5 is capped; roles.py bounded-seat launches it when the whole prompt fits`.
+- Every other role refuses a capped model, including an `inherit` seat on a thread that `--parent` names as Haiku 5.5, with `role '<role>' cannot use <provider>/claude-haiku-5-5: claude-haiku-5-5 is capped at 100000 prompt tokens, and only skill tests may run a capped model`. `show`, `validate`, and `write` refuse it with or without a catalog. `--force` does not override it. Built-in defaults and fallbacks skip capped models. When every runnable model is capped, the error says so.
+
+A skill test runs on Haiku 5.5 only through `bounded-seat`. Write the test brief to a file, list the files the child will read, and run:
+
+```bash
+python3 <pstack-runtime>/scripts/roles.py bounded-seat --cwd "$PWD" --catalog <file> --parent "<inheritedProviderInstanceId>/<inheritedModel>" --brief <brief file> --read <path> --read <path>
+```
+
+1. List every file the test needs, such as the skill's `SKILL.md` and the references it links. A test that runs commands, searches, writes, or spawns children stays on the `show` seat.
+2. `bounded-seat` resolves the configured or adaptive `skill tests` seat the way `show` does, per [Fallback](#fallback), before the cap check. The cap check uses the model the launch runs, which is this thread's model for `inherit`. It estimates the prompt as a 41,000-token harness allowance plus the brief and the listed files at 4 bytes per token. The allowance comes from a real T3 Claude Haiku 5.5 child whose first request was 40,427 tokens. A bare Cursor CLI request measured 29,539 tokens.
+3. It prints one JSON object. `notes` lists each change resolution made to the seat. When `capped` is true, launch `seat` with your brief and `mode: "async"`, even where a skill says `mode: "wait"`. Tell the child to read only the listed files. When `capped` is false, launch `seat` and read `reason` and `notes`. Over the target, `seat` is the adaptive uncapped seat, or `inherit` when no runnable model is uncapped and this thread's model is uncapped. When neither exists, it exits 2 with `role 'skill tests' has no uncapped seat for this test`. Launch nothing. Trim the brief or the listed files and run it again.
+4. Watch a capped child. Wait with `t3_thread_wait` and `timeoutMs: 60000`. After each timeout, read it with `t3_thread_read`, `view: "activity"`. Past 15 activity items, call `task_cancel` and rerun the test once on the `show` seat.
 
 ## Isolation
 

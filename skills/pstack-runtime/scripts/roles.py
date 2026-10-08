@@ -47,6 +47,11 @@ LADDER = {"none": 0, "minimal": 1, "low": 2, "medium": 3, "high": 4, "xhigh": 5,
 SPECIAL = {"ultracode", "ultrathink"}
 INHERIT = "inherit"
 SMALL_TIER = frozenset({"haiku", "mini", "nano", "flash", "lite", "fast", "small", "luna"})
+PROMPT_CAPS = {"claude-haiku-5-5": 100000}  # soft target: the estimated prompt stays at or under it
+BYTES_PER_TOKEN = 4                          # rough, for prose and code
+OVERHEAD_TOKENS = 41000                      # harness allowance: a real T3 Claude Haiku 5.5 child's first request was 40,427 tokens on 2026-10-07
+BOUNDED_ROLES = frozenset({"skill tests"})
+SKILL_TESTS_CAP_NOTE = "claude-haiku-5-5 is capped; roles.py bounded-seat launches it when the whole prompt fits"
 CATALOG_REQUIRED = "catalog-required"
 DEFAULT_PANEL = "default-panel"
 
@@ -57,6 +62,12 @@ class RolesError(Exception):
 
 class ModeSettingsError(RolesError):
     """A roles file has a mode or escalate value this version rejects."""
+
+
+@dataclass(frozen=True)
+class Parent:
+    provider: str
+    model: str
 
 
 @dataclass(frozen=True)
@@ -168,6 +179,136 @@ def parse_seat(text):
     return seat
 
 
+def bare_id(model_id):
+    return model_id.rsplit("/", 1)[-1].lower()
+
+
+def prompt_cap(model_id):
+    if not isinstance(model_id, str) or not model_id:
+        return None
+    return PROMPT_CAPS.get(bare_id(model_id))
+
+
+def _line_text(model_id):
+    """Bare id with a `5p3` version marker rewritten to `5.3`."""
+    return re.sub(r"(\d)p(\d)", r"\1.\2", bare_id(model_id))
+
+
+def model_version(model_id):
+    return tuple(int(part) for part in re.findall(r"\d+", _line_text(model_id)))
+
+
+def model_line(model_id):
+    return tuple(part for part in re.split(r"[-_.\d]+", _line_text(model_id)) if part)
+
+
+def window_tokens(choice_id):
+    """Context-window choice ids. k is 1000 and m is 1000000."""
+    match = re.fullmatch(r"(\d+)([km])", str(choice_id).lower())
+    if not match:
+        return None
+    return int(match.group(1)) * {"k": 1000, "m": 1000000}[match.group(2)]
+
+
+def cap_refusal(name, provider_id, model_id, *, inherit=False):
+    cap = prompt_cap(model_id)
+    if cap is None or name in BOUNDED_ROLES:
+        return None
+    verb = "inherit" if inherit else "use"
+    allowed = ", ".join(sorted(BOUNDED_ROLES))
+    return (
+        f"role {name!r} cannot {verb} {provider_id}/{model_id}: "
+        f"{bare_id(model_id)} is capped at {cap} prompt tokens, and only {allowed} may run a capped model"
+    )
+
+
+def parse_parent(text):
+    """Provider is the text before the first slash. The model id may contain slashes."""
+    message = (
+        f"--parent {text!r}: expected '<inheritedProviderInstanceId>/<inheritedModel>' "
+        "from orchestrator_capabilities"
+    )
+    if not isinstance(text, str) or "/" not in text or any(char.isspace() for char in text) or "?" in text:
+        raise RolesError(message)
+    provider, _, model = text.partition("/")
+    if not provider or not model:
+        raise RolesError(message)
+    return Parent(provider, model)
+
+
+def inherit_parent(catalog):
+    """Parent stored on a catalog file, or None when those keys are missing or malformed."""
+    if not isinstance(catalog, dict):
+        return None
+    provider = catalog.get("inheritedProviderInstanceId")
+    model = catalog.get("inheritedModel")
+    if not isinstance(provider, str) or not isinstance(model, str) or not provider or not model:
+        return None
+    try:
+        return parse_parent(f"{provider}/{model}")
+    except RolesError:
+        return None
+
+
+def stamp_parent(catalog, parent):
+    return {
+        **catalog,
+        "inheritedProviderInstanceId": None if parent is None else parent.provider,
+        "inheritedModel": None if parent is None else parent.model,
+    }
+
+
+def is_snapshot_path(path):
+    if path is None or str(path) == "-":
+        return False
+    try:
+        return Path(path).resolve() == snapshot_path().resolve()
+    except OSError:
+        return False
+
+
+def given_parent(args):
+    text = getattr(args, "parent", None)
+    if text is None:
+        return None
+    return parse_parent(text)
+
+
+def parent_for(args, catalog, catalog_path):
+    """--parent wins. A snapshot never supplies a parent. An explicit catalog file does."""
+    given = given_parent(args)
+    if given is not None:
+        return given
+    if catalog is None or is_snapshot_path(catalog_path):
+        return None
+    return inherit_parent(catalog)
+
+
+def all_capped_message(name, catalog):
+    seen = []
+    for provider in catalog.get("providers") or []:
+        if not runnable(provider):
+            continue
+        for model in models_of(provider):
+            cap = prompt_cap(model.get("id"))
+            if cap is None:
+                continue
+            label = f"{bare_id(model['id'])} at {cap}"
+            if label not in seen:
+                seen.append(label)
+    if not seen:
+        seen = [f"{model_id} at {cap}" for model_id, cap in PROMPT_CAPS.items()]
+    allowed = ", ".join(sorted(BOUNDED_ROLES))
+    return (
+        f"role {name!r} has no seat: every runnable model in the catalog is capped "
+        f"({', '.join(seen)} prompt tokens), and only {allowed} may run a capped model"
+    )
+
+
+def no_runnable_provider(catalog):
+    return not any(runnable(provider) for provider in (catalog or {}).get("providers") or [])
+
+
 def check_shape(config, origin):
     if not isinstance(config, dict):
         raise RolesError(f"{origin}: expected an object")
@@ -195,6 +336,11 @@ def check_shape(config, origin):
                 continue
             if not isinstance(seat, dict) or not seat.get("providerInstanceId") or not seat.get("model"):
                 raise RolesError(f"{origin}: role {name!r} has a seat without providerInstanceId and model")
+            provider_id = seat["providerInstanceId"]
+            model_id = seat["model"]
+            refusal = cap_refusal(name, provider_id, model_id)
+            if refusal:
+                raise RolesError(f"{origin}: {refusal}")
     return config
 
 
@@ -310,8 +456,11 @@ def default_effort_rank(model):
     return rank(default["id"])
 
 
-def skill_tests_seat(catalog):
-    """One bare seat. Prefer another family, then a small-tier id, then a lower default effort."""
+def skill_tests_seat(catalog, allow_capped=False):
+    """One bare seat. Prefer another family, then a small-tier id, then a lower default effort.
+
+    The winning row names a model line. The seat is the newest version of that line.
+    """
     parent = catalog.get("inheritedModel")
     parent_family = family(parent) if parent else None
     rows = []
@@ -320,12 +469,17 @@ def skill_tests_seat(catalog):
             continue
         for model_index, model in enumerate(models_of(provider)):
             model_id = model["id"]
+            if prompt_cap(model_id) is not None and not allow_capped:
+                continue
             other = parent_family is None or family(model_id) != parent_family
             small = bool(set(model_tokens(model_id)) & SMALL_TIER)
             rows.append((0 if other else 1, 0 if small else 1, default_effort_rank(model), provider_index, model_index, provider, model))
     if not rows:
         return INHERIT
-    *_, provider, model = min(rows)
+    line = model_line(min(rows)[-1]["id"])
+    pool = [row for row in rows if model_line(row[-1]["id"]) == line]
+    newest = max(model_version(row[-1]["id"]) for row in pool)
+    *_, provider, model = min(row for row in pool if model_version(row[-1]["id"]) == newest)
     return {"providerInstanceId": provider["providerInstanceId"], "model": model["id"]}
 
 
@@ -335,7 +489,8 @@ def _runnable_rows(catalog):
         if not runnable(provider):
             continue
         for model in models_of(provider):
-            rows.append((provider, model))
+            if prompt_cap(model["id"]) is None:
+                rows.append((provider, model))
     return rows
 
 
@@ -350,11 +505,13 @@ def _provider_for_exact(matches, wanted_family):
     return fallback
 
 
-def _preferred_seat(preference, catalog, budget="default"):
+def _preferred_seat(preference, catalog, budget="default", role=None):
     """Return a concrete runnable target and explanations of changed intent."""
+    if no_runnable_provider(catalog):
+        raise RolesError("no provider in the catalog can run child tasks")
     rows = _runnable_rows(catalog)
     if not rows:
-        raise RolesError("no provider in the catalog can run child tasks")
+        raise RolesError(all_capped_message(role or "bug-fix", catalog))
     wanted = preference.model_id
     wanted_family = family(wanted)
     exact = [(provider, model) for provider, model in rows if model["id"] == wanted]
@@ -371,7 +528,7 @@ def _preferred_seat(preference, catalog, budget="default"):
             parent_model_id = catalog.get("inheritedModel")
             parent = providers_by_id(catalog).get(parent_id) if parent_id else None
             parent_model = find_model(parent, parent_model_id) if runnable(parent) and parent_model_id else None
-            if parent_model is not None:
+            if parent_model is not None and prompt_cap(parent_model_id) is None:
                 provider, model = parent, parent_model
             else:
                 provider, model = rows[0]
@@ -392,27 +549,41 @@ def _preferred_seat(preference, catalog, budget="default"):
     return seat, tuple(notes)
 
 
-def _verifier_seats(catalog):
+def _first_uncapped(provider):
+    return next((model for model in models_of(provider) if prompt_cap(model["id"]) is None), None)
+
+
+def _verifier_seats(catalog, role="verifiers"):
     """One inherit seat for this thread, then one seat per new family. One seat is repeated to three."""
     parent = catalog.get("inheritedProviderInstanceId")
     parent_model = catalog.get("inheritedModel")
-    parent_runs = runnable(providers_by_id(catalog).get(parent)) if parent else False
+    parent_provider = providers_by_id(catalog).get(parent) if parent else None
+    parent_runs = runnable(parent_provider) if parent else False
+    parent_capped = bool(parent_model) and prompt_cap(parent_model) is not None
     seats, families = [], set()
-    if parent_runs and parent_model:
+    if parent_runs and parent_model and not parent_capped:
         seats.append(INHERIT)
         families.add(family(parent_model))
     for provider in catalog["providers"]:
-        if not runnable(provider) or (parent_runs and provider["providerInstanceId"] == parent):
+        if not runnable(provider):
             continue
-        model = models_of(provider)[0]["id"]
-        if family(model) in families:
+        # A capped parent has no inherit seat, so that provider still contributes its first uncapped model.
+        if parent_runs and not parent_capped and provider["providerInstanceId"] == parent:
             continue
-        families.add(family(model))
-        seats.append({"providerInstanceId": provider["providerInstanceId"], "model": model})
+        model = _first_uncapped(provider)
+        if model is None:
+            continue
+        model_id = model["id"]
+        if family(model_id) in families:
+            continue
+        families.add(family(model_id))
+        seats.append({"providerInstanceId": provider["providerInstanceId"], "model": model_id})
     if len(seats) == 1:
         return seats * 3
     if not seats:
-        raise RolesError("no provider in the catalog can run child tasks")
+        if no_runnable_provider(catalog):
+            raise RolesError("no provider in the catalog can run child tasks")
+        raise RolesError(all_capped_message(role, catalog))
     return seats
 
 
@@ -443,12 +614,12 @@ def default_seats(name, catalog, budget="default"):
             "call orchestrator_capabilities and rerun roles.py show --catalog",
         ))
     if policy is AdaptiveDefault.SKILL_TESTS:
-        return DefaultSelection((skill_tests_seat(catalog),))
+        return DefaultSelection((skill_tests_seat(catalog, allow_capped=True),))
     if policy is AdaptiveDefault.VERIFIERS:
-        return DefaultSelection(tuple(_verifier_seats(catalog)))
+        return DefaultSelection(tuple(_verifier_seats(catalog, name)))
     seats, notes = [], []
     for number, preference in enumerate(policy, 1):
-        seat, seat_notes = _preferred_seat(preference, catalog, budget)
+        seat, seat_notes = _preferred_seat(preference, catalog, budget, name)
         seats.append(seat)
         notes.extend(f"{name} seat {number}: {note}" for note in seat_notes)
     diversity = _lost_diversity(name, seats)
@@ -471,21 +642,82 @@ def inherit_with_budget(catalog, budget):
     return seat, f"inherit made explicit as {parent}/{parent_model} so the {budget} budget applies"
 
 
-def resolve_seat(seat, catalog, budget):
+def _context_window_choice(model):
+    option = next((item for item in options_of(model) if item.get("id") == "contextWindow" and item.get("type") == "select"), None)
+    if option is None:
+        return None
+    ranked = []
+    for choice in option.get("options") or []:
+        tokens = window_tokens(choice.get("id"))
+        if tokens is not None:
+            ranked.append((tokens, choice["id"]))
+    if not ranked:
+        return None
+    return min(ranked)[1]
+
+
+def _with_window(seat, model):
+    if prompt_cap(seat.get("model")) is None:
+        return seat
+    choice = _context_window_choice(model)
+    if choice is None:
+        return seat
+    return {**seat, "options": {**(seat.get("options") or {}), "contextWindow": choice}}
+
+
+def _explicit_parent_window(catalog, budget):
+    """Bounded inherit of a capped parent becomes that seat when a context window is offered."""
+    parent_id = catalog.get("inheritedProviderInstanceId")
+    parent_model_id = catalog.get("inheritedModel")
+    if not parent_id or not parent_model_id or prompt_cap(parent_model_id) is None:
+        return None
+    provider = providers_by_id(catalog).get(parent_id)
+    model = find_model(provider, parent_model_id) if provider else None
+    if model is None or _context_window_choice(model) is None:
+        return None
+    seat = apply_budget({"providerInstanceId": parent_id, "model": parent_model_id}, model, budget)
+    return _with_window(seat, model)
+
+
+def _resolve_inherit(catalog, budget, name):
+    parent = inherit_parent(catalog)
+    if name not in BOUNDED_ROLES and parent is not None and prompt_cap(parent.model) is not None:
+        raise RolesError(cap_refusal(name, parent.provider, parent.model, inherit=True))
+    value, note = inherit_with_budget(catalog, budget)
+    if isinstance(value, dict):
+        provider = providers_by_id(catalog).get(value["providerInstanceId"])
+        model = find_model(provider, value["model"]) if provider else None
+        if model is not None:
+            value = _with_window(value, model)
+        return value, note
+    if name in BOUNDED_ROLES:
+        explicit = _explicit_parent_window(catalog, budget)
+        if explicit is not None:
+            return explicit, note
+    return value, note
+
+
+def resolve_seat(seat, catalog, budget, name):
     """Return (resolved seat, notes, problems). Problems are seats the catalog rejects."""
     if seat == INHERIT:
-        value, note = inherit_with_budget(catalog, budget)
+        value, note = _resolve_inherit(catalog, budget, name)
         return value, [{"info": note}] if note else [], []
     provider = providers_by_id(catalog).get(seat["providerInstanceId"])
     if not runnable(provider):
         reason = "; ".join(provider.get("constraints") or []) if provider else "not in catalog"
         note = f"{seat['providerInstanceId']} is not runnable ({reason}); seat inherits the parent"
-        value, budget_note = inherit_with_budget(catalog, budget)
+        value, budget_note = _resolve_inherit(catalog, budget, name)
         return value, [note] + ([{"info": budget_note}] if budget_note else []), [note]
     notes, problems = [], []
     model = find_model(provider, seat["model"])
     if model is None:
-        model = models_of(provider)[0]
+        if name in BOUNDED_ROLES:
+            model = models_of(provider)[0]
+        else:
+            model = _first_uncapped(provider)
+            if model is None:
+                first = models_of(provider)[0]
+                raise RolesError(cap_refusal(name, provider["providerInstanceId"], first["id"]))
         note = f"{seat['providerInstanceId']}/{seat['model']} is not in the catalog; using {model['id']}"
         notes.append(note)
         problems.append(note)
@@ -504,11 +736,76 @@ def resolve_seat(seat, catalog, budget):
     seat = {key: value for key, value in seat.items() if key != "options"}
     if options:
         seat["options"] = options
-    return apply_budget(seat, model, budget), notes, problems
+    return _with_window(apply_budget(seat, model, budget), model), notes, problems
 
 
-def resolve(config, catalog=None, names=None):
+def present_seat(seat, catalog, budget):
+    if not isinstance(seat, dict) or catalog is None:
+        return seat
+    provider = providers_by_id(catalog).get(seat["providerInstanceId"])
+    model = find_model(provider, seat["model"]) if provider else None
+    if model is None:
+        return seat
+    return _with_window(apply_budget(dict(seat), model, budget), model)
+
+
+def skill_tests_replacement(catalog, budget):
+    if catalog is None:
+        return CATALOG_REQUIRED, SKILL_TESTS_CAP_NOTE
+    if no_runnable_provider(catalog):
+        raise RolesError("no provider in the catalog can run child tasks")
+    seat = skill_tests_seat(catalog, allow_capped=False)
+    if not isinstance(seat, dict) or prompt_cap(seat.get("model")) is not None:
+        raise RolesError(all_capped_message("skill tests", catalog))
+    return [present_seat(seat, catalog, budget)], SKILL_TESTS_CAP_NOTE
+
+
+def _seats_include_inherit(seats):
+    if seats in (INHERIT, DEFAULT_PANEL):
+        return True
+    return isinstance(seats, list) and any(seat == INHERIT for seat in seats)
+
+
+def _seats_include_capped(seats):
+    if not isinstance(seats, list):
+        return False
+    return any(isinstance(seat, dict) and prompt_cap(seat.get("model")) is not None for seat in seats)
+
+
+def settle_caps(name, seats, catalog, parent, budget):
+    """Settle show's output: keep a capped model out of every emitted seat, and refuse a known capped parent outside skill tests.
+
+    bounded-seat deliberately skips this so a capped seat under the target still launches.
+    """
+    capped_parent = parent is not None and prompt_cap(parent.model) is not None
+    if _seats_include_inherit(seats) and capped_parent:
+        if name in BOUNDED_ROLES:
+            return skill_tests_replacement(catalog, budget)
+        raise RolesError(cap_refusal(name, parent.provider, parent.model, inherit=True))
+    if _seats_include_capped(seats):
+        if name in BOUNDED_ROLES:
+            return skill_tests_replacement(catalog, budget)
+        for seat in seats:
+            if isinstance(seat, dict):
+                message = cap_refusal(name, seat.get("providerInstanceId"), seat.get("model"))
+                if message:
+                    raise RolesError(message)
+    return seats, None
+
+
+def _store_settled(entry, name, catalog, parent, config):
+    seats, note = settle_caps(name, entry["seats"], catalog, parent, config["budget"])
+    entry["seats"] = seats
+    if note:
+        entry["note"] = note
+
+
+def resolve(config, catalog=None, names=None, parent=None):
     names = names or ROLES
+    if catalog is not None:
+        if parent is None:
+            parent = inherit_parent(catalog)
+        catalog = stamp_parent(catalog, parent)
     result = {
         "budget": config["budget"],
         "mode": config["mode"] if "mode" in config else "full",
@@ -528,6 +825,7 @@ def resolve(config, catalog=None, names=None):
                 entry["seats"] = selection.seats
                 if selection.notes:
                     entry["note"] = selection.notes[0]
+                _store_settled(entry, name, catalog, parent, config)
                 result["roles"][name] = entry
                 continue
             seats = list(selection.seats)
@@ -540,7 +838,7 @@ def resolve(config, catalog=None, names=None):
         else:
             resolved, notes = [], []
             for seat in seats:
-                value, seat_notes, _ = resolve_seat(seat, catalog, config["budget"])
+                value, seat_notes, _ = resolve_seat(seat, catalog, config["budget"], name)
                 resolved.append(value)
                 notes.extend(seat_notes)
             entry["seats"] = resolved
@@ -550,6 +848,7 @@ def resolve(config, catalog=None, names=None):
                 entry["notes"] = problems
             if info:
                 entry["info"] = info
+        _store_settled(entry, name, catalog, parent, config)
         result["roles"][name] = entry
     return result
 
@@ -566,25 +865,42 @@ def validate(config, catalog):
     problems = []
     for name, seats in config["roles"].items():
         for seat in seats:
-            _, _, seat_problems = resolve_seat(seat, catalog, config["budget"])
+            _, _, seat_problems = resolve_seat(seat, catalog, config["budget"], name)
             problems.extend(f"{name}: {problem}" for problem in seat_problems)
     return problems
 
 
+def load_show_catalog(args):
+    if args.catalog:
+        return args.catalog, load_catalog(args.catalog)
+    path = snapshot_path()
+    if path.is_file():
+        return path, load_catalog(path)
+    return None, None
+
+
+def catalog_for_check(args, catalog, catalog_path):
+    """Parent for this invocation, and a catalog copy whose inherited keys match it."""
+    parent = parent_for(args, catalog, catalog_path)
+    if catalog is None:
+        return parent, None
+    return parent, stamp_parent(catalog, parent)
+
+
 def command_show(args):
+    given_parent(args)
     config = merged_config(args.cwd, args.config, args.project_config)
-    catalog_path = args.catalog or (snapshot_path() if snapshot_path().is_file() else None)
-    catalog = load_catalog(catalog_path) if catalog_path else None
-    if catalog is not None and (args.parent or not args.catalog):
-        # A saved snapshot records whichever thread ran setup, not this one.
-        provider, _, model = (args.parent or "").partition("/")
-        catalog = {**catalog, "inheritedProviderInstanceId": provider or None, "inheritedModel": model or None}
-    print(json.dumps(resolve(config, catalog, args.role), indent=2))
+    catalog_path, catalog = load_show_catalog(args)
+    parent, catalog = catalog_for_check(args, catalog, catalog_path)
+    print(json.dumps(resolve(config, catalog, args.role, parent), indent=2))
 
 
 def command_validate(args):
+    given_parent(args)
     config = merged_config(args.cwd, args.config, args.project_config)
-    problems = validate(config, load_catalog(args.catalog))
+    catalog = load_catalog(args.catalog)
+    _parent, catalog = catalog_for_check(args, catalog, args.catalog)
+    problems = validate(config, catalog)
     for problem in problems:
         print(problem)
     if not problems:
@@ -593,6 +909,7 @@ def command_validate(args):
 
 
 def command_write(args):
+    given_parent(args)
     catalog = load_catalog(args.catalog)
     target = project_config_path(args.cwd) if args.project else (Path(args.config) if args.config else user_config_path())
     try:
@@ -638,13 +955,93 @@ def command_write(args):
     check_shape(config, target)
     if "escalate" in config:
         config["escalate"] = list(config["escalate"])
-    problems = validate({"budget": config.get("budget", "default"), "roles": roles, "sources": {}}, catalog)
+    _parent, checking = catalog_for_check(args, catalog, args.catalog)
+    problems = validate({"budget": config.get("budget", "default"), "roles": roles, "sources": {}}, checking)
     if problems and not args.force:
         raise RolesError("refusing to write; these seats do not match the catalog:\n" + "\n".join(problems))
     write_atomic(target, config)
     if not args.project and not args.config:
         write_atomic(snapshot_path(), catalog)
     print(f"wrote {target}")
+
+
+def check_reads(paths):
+    for path in paths:
+        if not Path(path).is_file():
+            raise RolesError(f"--read {path}: not a file")
+
+
+def prompt_estimate(brief_bytes, read_bytes, model_id):
+    payload = brief_bytes + read_bytes
+    tokens = OVERHEAD_TOKENS + (payload + BYTES_PER_TOKEN - 1) // BYTES_PER_TOKEN
+    return {
+        "overheadTokens": OVERHEAD_TOKENS,
+        "briefBytes": brief_bytes,
+        "readBytes": read_bytes,
+        "tokens": tokens,
+        "target": prompt_cap(model_id),
+    }
+
+
+def launch_model(seat, parent):
+    """Model a launch of this resolved seat runs: the target's model, or the parent's for inherit."""
+    if seat == INHERIT:
+        return parent.model
+    return seat["model"]
+
+
+def emit_bounded(seat, capped, estimate, reason, notes):
+    print(json.dumps({
+        "seat": seat,
+        "capped": capped,
+        "estimate": estimate,
+        "reason": reason,
+        "notes": notes,
+    }, indent=2))
+
+
+def command_bounded_seat(args):
+    given_parent(args)
+    config = merged_config(args.cwd, args.config, args.project_config)
+    catalog = load_catalog(args.catalog)
+    parent, catalog = catalog_for_check(args, catalog, args.catalog)
+    brief = Path(args.brief)
+    if not brief.is_file():
+        raise RolesError(f"{args.brief}: brief not found")
+    reads = args.read or []
+    check_reads(reads)
+    budget = config["budget"]
+    configured = (config.get("roles") or {}).get("skill tests")
+    candidate = configured[0] if configured else skill_tests_seat(catalog, allow_capped=True)
+
+    def resolved(seat):
+        value, raw_notes, _problems = resolve_seat(seat, catalog, budget, "skill tests")
+        notes = [note["info"] if isinstance(note, dict) else note for note in raw_notes]
+        return value, notes
+
+    seat, notes = resolved(candidate)
+    model = launch_model(seat, parent)
+    read_bytes = sum(Path(path).stat().st_size for path in reads)
+    estimate = prompt_estimate(brief.stat().st_size, read_bytes, model)
+    if prompt_cap(model) is None:
+        emit_bounded(seat, False, estimate, None, notes)
+        return 0
+    if estimate["tokens"] <= estimate["target"]:
+        emit_bounded(seat, True, estimate, None, notes)
+        return 0
+    reason = (
+        f"estimate {estimate['tokens']} tokens is over the {estimate['target']}-token target "
+        f"for {bare_id(model)}"
+    )
+    fallback, more = resolved(skill_tests_seat(catalog, allow_capped=False))
+    if prompt_cap(launch_model(fallback, parent)) is not None:
+        raise RolesError(
+            "role 'skill tests' has no uncapped seat for this test: "
+            f"{reason}, no runnable model in the catalog is uncapped, "
+            f"and the parent {parent.provider}/{parent.model} is capped"
+        )
+    emit_bounded(fallback, False, estimate, reason, notes + more)
+    return 0
 
 
 def persona_path():
@@ -759,8 +1156,8 @@ def main(argv=None):
         if name != "write":
             command.add_argument("--project-config", help="project roles file (default <repo>/.pstack/t3-roles.json)")
         command.add_argument("--catalog", required=name != "show", help="saved orchestrator_capabilities JSON, or - for stdin")
+        command.add_argument("--parent", help="this thread's provider/model from orchestrator_capabilities (inheritedProviderInstanceId/inheritedModel)")
     sub.choices["show"].add_argument("--role", action="append")
-    sub.choices["show"].add_argument("--parent", help="this thread's provider/model from orchestrator_capabilities (inheritedProviderInstanceId/inheritedModel)")
     write = sub.choices["write"]
     write.add_argument("--budget", choices=list(BUDGETS))
     write.add_argument("--mode", choices=MODES)
@@ -772,6 +1169,14 @@ def main(argv=None):
     write.add_argument("--project", action="store_true", help="write the project file instead of the user file")
     write.add_argument("--keep", action="store_true", help="keep roles already in the target file")
     write.add_argument("--force", action="store_true", help="write even if seats do not match the catalog")
+    bounded = sub.add_parser("bounded-seat")
+    bounded.add_argument("--cwd", default=os.getcwd())
+    bounded.add_argument("--config", help="user roles file (default ~/.config/pstack-t3/roles.json)")
+    bounded.add_argument("--project-config", help="project roles file (default <repo>/.pstack/t3-roles.json)")
+    bounded.add_argument("--catalog", required=True, help="saved orchestrator_capabilities JSON, or - for stdin")
+    bounded.add_argument("--parent", required=True, help="this thread's provider/model from orchestrator_capabilities (inheritedProviderInstanceId/inheritedModel)")
+    bounded.add_argument("--brief", required=True, help="brief file whose bytes are counted toward the cap")
+    bounded.add_argument("--read", action="append", help="file counted toward the estimate")
     check_brief = sub.add_parser("check-brief")
     check_brief.add_argument("brief", help="brief file to check")
     args = parser.parse_args(argv)
@@ -782,6 +1187,7 @@ def main(argv=None):
             "show": command_show,
             "validate": command_validate,
             "write": command_write,
+            "bounded-seat": command_bounded_seat,
             "check-brief": command_check_brief,
         }[args.command](args) or 0
     except ModeSettingsError as error:
