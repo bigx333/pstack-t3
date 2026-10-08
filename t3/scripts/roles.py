@@ -7,9 +7,12 @@ T3's orchestrator_capabilities tool returns.
 """
 
 import argparse
+import fnmatch
 import json
 import os
+import posixpath
 import re
+import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass
@@ -42,6 +45,7 @@ PANEL_ROLES = [
 ROLES = SINGLE_ROLES + PANEL_ROLES
 BUDGETS = {"default": None, "small": "medium", "medium": "high", "large": "xhigh", "unlimited": "max"}
 MODES = ("full", "light")
+ATTEMPTS = ("first", "fix", "bounce")
 EFFORT_IDS = ("effort", "reasoningEffort", "reasoning_effort", "reasoning")
 LADDER = {"none": 0, "minimal": 1, "low": 2, "medium": 3, "high": 4, "xhigh": 5, "extra-high": 5, "extra_high": 5, "max": 6, "ultra": 7}
 SPECIAL = {"ultracode", "ultrathink"}
@@ -61,7 +65,57 @@ class RolesError(Exception):
 
 
 class ModeSettingsError(RolesError):
-    """A roles file has a mode or escalate value this version rejects."""
+    """A mode setting or mode input this version rejects."""
+
+
+@dataclass(frozen=True)
+class ModeDecision:
+    """One mode decision and where it came from.
+
+    label is the brief grammar's Mode source value. where is what show prints
+    as modeSource. A file level uses the file path. Every other level uses the label.
+    """
+
+    mode: str
+    label: str
+    where: str
+
+
+DEFAULT_MODE = ModeDecision("full", "default", "default")
+
+
+def effective_mode(config, brief=None, session=None, coordinator=None):
+    """Brief, then session, then coordinator, then the merged file level, then full."""
+    for value, label in ((brief, "brief"), (session, "session"), (coordinator, "restaurant.json")):
+        if value is not None:
+            return ModeDecision(value, label, label)
+    return config.get("mode", DEFAULT_MODE)
+
+
+def seat_budget(budget, mode):
+    """Light caps only a default budget. An explicit budget wins both ways."""
+    return "small" if mode == "light" and budget == "default" else budget
+
+
+NO_CATALOG_INFO = (
+    "info: light mode caps reasoning at medium, but show had no catalog, "
+    "so no seat was capped. Rerun with --catalog and --parent."
+)
+NO_PARENT_INFO = (
+    "info: light mode caps reasoning at medium, but show had no --parent, "
+    "so an inherit seat may keep the parent's reasoning. Rerun with --parent."
+)
+
+
+def light_cap_gap(decision, budget, has_catalog, has_parent):
+    """The info line show prints when the light cap may not have reached every seat."""
+    if seat_budget(budget, decision.mode) == budget:
+        return None
+    if not has_catalog:
+        return NO_CATALOG_INFO
+    if not has_parent:
+        return NO_PARENT_INFO
+    return None
 
 
 @dataclass(frozen=True)
@@ -309,6 +363,21 @@ def no_runnable_provider(catalog):
     return not any(runnable(provider) for provider in (catalog or {}).get("providers") or [])
 
 
+def canonical(path, kind="lease"):
+    """Repository-relative POSIX path with no aliases. An empty string is the whole repository."""
+    value = posixpath.normpath(path.strip().replace("\\", "/")).lstrip("/")
+    if value in (".", ""):
+        return ""
+    if value == ".." or value.startswith("../"):
+        raise ModeSettingsError(f"{kind} path {path!r} leaves the repository")
+    return value
+
+
+def lease_paths(text):
+    """Leases land.py would claim for this comma-separated list."""
+    return sorted({canonical(part) for part in text.split(",")})
+
+
 def check_shape(config, origin):
     if not isinstance(config, dict):
         raise RolesError(f"{origin}: expected an object")
@@ -321,6 +390,11 @@ def check_shape(config, origin):
         escalate = config["escalate"]
         if not isinstance(escalate, list) or not all(isinstance(item, str) and item for item in escalate):
             raise ModeSettingsError(f"{origin}: escalate must be a list of strings")
+        for item in escalate:
+            try:
+                canonical(item, "escalate pattern")  # traversal check only; the stored pattern stays raw
+            except ModeSettingsError:
+                raise ModeSettingsError(f"{origin}: escalate pattern {item!r} leaves the repository") from None
     roles = config.get("roles", {})
     if not isinstance(roles, dict):
         raise RolesError(f"{origin}: roles must be an object")
@@ -355,17 +429,16 @@ def merged_config(cwd, user_path=None, project_path=None):
             roles[name] = seats
             sources[name] = str(origin)
     if "mode" in project:
-        mode, mode_source = project["mode"], str(project_path)
+        mode = ModeDecision(project["mode"], ".pstack/t3-roles.json", str(project_path))
     elif "mode" in user:
-        mode, mode_source = user["mode"], str(user_path)
+        mode = ModeDecision(user["mode"], "roles.json", str(user_path))
     else:
-        mode, mode_source = "full", "default"
+        mode = DEFAULT_MODE
     escalate = list(project["escalate"]) if "escalate" in project else None
     budget = project["budget"] if "budget" in project else user.get("budget", "default")
     return {
         "budget": budget,
         "mode": mode,
-        "modeSource": mode_source,
         "escalate": escalate,
         "roles": roles,
         "sources": sources,
@@ -793,8 +866,8 @@ def settle_caps(name, seats, catalog, parent, budget):
     return seats, None
 
 
-def _store_settled(entry, name, catalog, parent, config):
-    seats, note = settle_caps(name, entry["seats"], catalog, parent, config["budget"])
+def _store_settled(entry, name, catalog, parent, budget):
+    seats, note = settle_caps(name, entry["seats"], catalog, parent, budget)
     entry["seats"] = seats
     if note:
         entry["note"] = note
@@ -802,14 +875,16 @@ def _store_settled(entry, name, catalog, parent, config):
 
 def resolve(config, catalog=None, names=None, parent=None):
     names = names or ROLES
+    decision = config.get("mode", DEFAULT_MODE)
+    budget = seat_budget(config["budget"], decision.mode)
     if catalog is not None:
         if parent is None:
             parent = inherit_parent(catalog)
         catalog = stamp_parent(catalog, parent)
     result = {
         "budget": config["budget"],
-        "mode": config["mode"] if "mode" in config else "full",
-        "modeSource": config["modeSource"] if "modeSource" in config else "default",
+        "mode": decision.mode,
+        "modeSource": decision.where,
         "escalate": config["escalate"] if "escalate" in config else None,
         "catalog": bool(catalog),
         "roles": {},
@@ -820,12 +895,12 @@ def resolve(config, catalog=None, names=None, parent=None):
         configured = config["roles"].get(name)
         entry = {"source": config["sources"].get(name, "default")}
         if configured is None:
-            selection = default_seats(name, catalog, config["budget"])
+            selection = default_seats(name, catalog, budget)
             if isinstance(selection.seats, str):
                 entry["seats"] = selection.seats
                 if selection.notes:
                     entry["note"] = selection.notes[0]
-                _store_settled(entry, name, catalog, parent, config)
+                _store_settled(entry, name, catalog, parent, budget)
                 result["roles"][name] = entry
                 continue
             seats = list(selection.seats)
@@ -838,7 +913,7 @@ def resolve(config, catalog=None, names=None, parent=None):
         else:
             resolved, notes = [], []
             for seat in seats:
-                value, seat_notes, _ = resolve_seat(seat, catalog, config["budget"], name)
+                value, seat_notes, _ = resolve_seat(seat, catalog, budget, name)
                 resolved.append(value)
                 notes.extend(seat_notes)
             entry["seats"] = resolved
@@ -848,7 +923,7 @@ def resolve(config, catalog=None, names=None, parent=None):
                 entry["notes"] = problems
             if info:
                 entry["info"] = info
-        _store_settled(entry, name, catalog, parent, config)
+        _store_settled(entry, name, catalog, parent, budget)
         result["roles"][name] = entry
     return result
 
@@ -890,9 +965,14 @@ def catalog_for_check(args, catalog, catalog_path):
 def command_show(args):
     given_parent(args)
     config = merged_config(args.cwd, args.config, args.project_config)
+    decision = effective_mode(config, args.brief_mode, args.session_mode, args.coordinator_mode)
+    config["mode"] = decision
     catalog_path, catalog = load_show_catalog(args)
     parent, catalog = catalog_for_check(args, catalog, catalog_path)
     print(json.dumps(resolve(config, catalog, args.role, parent), indent=2))
+    line = light_cap_gap(decision, config["budget"], catalog is not None, args.parent is not None)
+    if line:
+        print(line, file=sys.stderr)
 
 
 def command_validate(args):
@@ -1010,7 +1090,8 @@ def command_bounded_seat(args):
         raise RolesError(f"{args.brief}: brief not found")
     reads = args.read or []
     check_reads(reads)
-    budget = config["budget"]
+    decision = effective_mode(config, args.brief_mode, args.session_mode, args.coordinator_mode)
+    budget = seat_budget(config["budget"], decision.mode)
     configured = (config.get("roles") or {}).get("skill tests")
     candidate = configured[0] if configured else skill_tests_seat(catalog, allow_capped=True)
 
@@ -1048,6 +1129,22 @@ def persona_path():
     return Path(__file__).resolve().parents[1] / "agents" / "poteto-agent.md"
 
 
+def playbook_stems():
+    root = Path(__file__).resolve().parents[2]
+    rendered_tree = root / "poteto-mode" / "playbooks"
+    source_checkout = root / "skills" / "poteto-mode" / "playbooks"
+    candidates = (rendered_tree, source_checkout)
+    directory = next((candidate for candidate in candidates if candidate.is_dir()), None)
+    if directory is None:
+        raise RolesError("no playbook directory: " + ", ".join(str(candidate) for candidate in candidates))
+    stems = frozenset(
+        entry.stem for entry in directory.iterdir() if entry.is_file() and entry.suffix == ".md"
+    )
+    if not stems:
+        raise RolesError(f"{directory}: playbook directory is empty")
+    return stems
+
+
 def load_brief_rules():
     path = persona_path()
     try:
@@ -1067,19 +1164,7 @@ def load_brief_rules():
     body = "".join(lines[fences[1] + 1:]).strip()
     if not body:
         raise RolesError(f"{path}: persona body is empty")
-    root = Path(__file__).resolve().parents[2]
-    rendered_tree = root / "poteto-mode" / "playbooks"
-    source_checkout = root / "skills" / "poteto-mode" / "playbooks"
-    candidates = (rendered_tree, source_checkout)
-    directory = next((candidate for candidate in candidates if candidate.is_dir()), None)
-    if directory is None:
-        raise RolesError("no playbook directory: " + ", ".join(str(candidate) for candidate in candidates))
-    stems = frozenset(
-        entry.stem for entry in directory.iterdir() if entry.is_file() and entry.suffix == ".md"
-    )
-    if not stems:
-        raise RolesError(f"{directory}: playbook directory is empty")
-    return body, stems
+    return body, playbook_stems()
 
 
 def playbook_values(text):
@@ -1125,6 +1210,160 @@ def brief_problems(text, persona_body, playbooks):
     return problems
 
 
+def segments_match(pattern, path):
+    """Whole-segment glob. ** matches zero or more segments. Other segments never cross a slash."""
+
+    def match(pattern_parts, path_parts):
+        if not pattern_parts:
+            return not path_parts
+        if pattern_parts[0] == "**":
+            return any(match(pattern_parts[1:], path_parts[index:]) for index in range(len(path_parts) + 1))
+        return (
+            bool(path_parts)
+            and fnmatch.fnmatchcase(path_parts[0], pattern_parts[0])
+            and match(pattern_parts[1:], path_parts[1:])
+        )
+
+    pattern_parts = [] if pattern == "" else pattern.split("/")
+    path_parts = [] if path == "" else path.split("/")
+    return match(pattern_parts, path_parts)
+
+
+def escalated_path(leases, patterns, tracked):
+    """First covered path that matches a pattern. Candidates are sorted, so pattern order does not matter."""
+    covered = set()
+    for lease in leases:
+        if lease == "":
+            covered.update(tracked)
+            continue
+        covered.add(lease)
+        prefix = lease + "/"
+        covered.update(path for path in tracked if path.startswith(prefix))
+    for path in sorted(covered):
+        if any(segments_match(pattern, path) for pattern in patterns):
+            return path
+    return None
+
+
+def tracked_files(cwd):
+    """Repository-relative tracked paths. Any git failure means cwd is not a checkout."""
+    message = f"--paths needs a git checkout to list tracked files, and {cwd} is not one"
+
+    def git(args):
+        try:
+            return subprocess.run(args, capture_output=True)
+        except OSError as error:
+            raise RolesError(message) from error
+
+    top = git(["git", "-C", str(cwd), "rev-parse", "--show-toplevel"])
+    lines = top.stdout.decode("utf-8", "surrogateescape").splitlines()
+    if top.returncode != 0 or not lines:
+        raise RolesError(message)
+    listing = git(["git", "-C", lines[0], "ls-files", "-z"])
+    if listing.returncode != 0:
+        raise RolesError(message)
+    parts = listing.stdout.decode("utf-8", "surrogateescape").split("\0")
+    if parts and parts[-1] == "":
+        del parts[-1]
+    return parts
+
+
+def escalation_reason(durable, hit, send_backs):
+    """Durable reason first, then a covered path, then a second send-back."""
+    if durable is not None:
+        return durable
+    if hit is not None:
+        return f"lease covers {hit}"
+    if send_backs >= 2:
+        return "second send-back"
+    return None
+
+
+def escalate(decision, reason):
+    """Escalation only moves toward full."""
+    if reason is None:
+        return decision
+    label = f"escalated: {reason}"
+    return ModeDecision("full", label, label)
+
+
+class Waivers(dict):
+    """Map (playbook stem, attempt kind) to waived step names, in table order.
+
+    A missing playbook with a known attempt waives nothing. An unknown attempt kind is a KeyError.
+    """
+
+    def __missing__(self, key):
+        if isinstance(key, tuple) and len(key) == 2 and key[1] in ATTEMPTS:
+            return ()
+        raise KeyError(key)
+
+
+_WAIVER_ROWS = {
+    "feature": (
+        ("Arena", "Interrogate", "Comment Sicko"),
+        ("How", "Architect", "Arena", "Interrogate", "Comment Sicko"),
+    ),
+    "bug-fix": (("Comment Sicko",), ("How", "Why", "Architect", "Comment Sicko")),
+    "refactoring": (("Comment Sicko",), ("How", "Architect", "Comment Sicko")),
+    "perf-issue": (("Comment Sicko",), ("How", "Architect", "Comment Sicko")),
+    "hillclimb": (("Comment Sicko",), ("How", "Comment Sicko")),
+    "authoring-a-skill": (
+        ("Comment Sicko", "Second-provider test"),
+        ("Comment Sicko", "Second-provider test"),
+    ),
+}
+LIGHT_WAIVERS = Waivers({
+    (playbook, attempt): first if attempt == "first" else retry
+    for playbook, (first, retry) in _WAIVER_ROWS.items()
+    for attempt in ATTEMPTS
+})
+
+
+def durable_reason(text):
+    if text is None:
+        return None
+    if text.strip() == "" or "\n" in text or "\r" in text:
+        raise ModeSettingsError("--escalated needs a one-line reason")
+    return text.strip()
+
+
+def brief_lines(decision, key):
+    """Playbook, Mode, Mode source, Attempt, and Waived by mode, each when it applies."""
+    lines = [] if key is None else [f"Playbook: playbooks/{key[0]}.md"]
+    lines.append(f"Mode: {decision.mode}")
+    lines.append(f"Mode source: {decision.label}")
+    if key is not None:
+        lines.append(f"Attempt: {key[1]}")
+        waived = LIGHT_WAIVERS[key] if decision.mode == "light" else ()
+        if waived:
+            lines.append("Waived by mode: " + ", ".join(waived))
+    return lines
+
+
+def work_key(playbook, attempt):
+    if (playbook is None) != (attempt is None):
+        raise ModeSettingsError("--playbook and --attempt go together: pass both or neither")
+    if playbook is None:
+        return None
+    stems = playbook_stems()
+    if playbook not in stems:
+        names = ", ".join(sorted(stems))
+        raise ModeSettingsError(f"unknown playbook '{playbook}': expected one of: {names}")
+    return (playbook, attempt)
+
+
+def command_mode(args):
+    config = merged_config(args.cwd, args.config, args.project_config)
+    decision = effective_mode(config, args.brief_mode, args.session_mode, args.coordinator_mode)
+    key = work_key(args.playbook, args.attempt)
+    durable = durable_reason(args.escalated)
+    leases = lease_paths(args.paths) if args.paths is not None else []
+    patterns = [canonical(item) for item in (config["escalate"] or [])]
+    hit = escalated_path(leases, patterns, tracked_files(args.cwd)) if leases and patterns else None
+    print("\n".join(brief_lines(escalate(decision, escalation_reason(durable, hit, args.send_backs)), key)))
+
+
 def command_check_brief(args):
     path = Path(args.brief)
     try:
@@ -1144,6 +1383,16 @@ def command_check_brief(args):
     stem = playbook_stem(playbook_values(text)[0])
     print(f"ok playbooks/{stem}.md")
     return 0
+
+
+def non_negative_int(text):
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid non-negative int value: {text!r}") from None
+    if value < 0:
+        raise argparse.ArgumentTypeError(f"invalid non-negative int value: {text!r}")
+    return value
 
 
 def main(argv=None):
@@ -1177,6 +1426,24 @@ def main(argv=None):
     bounded.add_argument("--parent", required=True, help="this thread's provider/model from orchestrator_capabilities (inheritedProviderInstanceId/inheritedModel)")
     bounded.add_argument("--brief", required=True, help="brief file whose bytes are counted toward the cap")
     bounded.add_argument("--read", action="append", help="file counted toward the estimate")
+    mode = sub.add_parser("mode")
+    mode.add_argument("--cwd", default=os.getcwd())
+    mode.add_argument("--config", help="user roles file (default ~/.config/pstack-t3/roles.json)")
+    mode.add_argument("--project-config", help="project roles file (default <repo>/.pstack/t3-roles.json)")
+    mode.add_argument("--paths", help="comma-separated leases")
+    mode.add_argument("--send-backs", type=non_negative_int, default=0,
+                      help="send-back count; 2 or more forces full mode")
+    mode.add_argument("--escalated",
+                      help="recorded one-line escalation reason; forces full mode and wins over paths and send-backs")
+    mode.add_argument("--playbook", help="playbook stem, such as bug-fix")
+    mode.add_argument("--attempt", choices=ATTEMPTS)
+    for command in (sub.choices["show"], bounded, mode):
+        command.add_argument("--brief-mode", choices=MODES,
+                             help="brief mode; overrides session, coordinator, project, and user modes")
+        command.add_argument("--session-mode", choices=MODES,
+                             help="session mode; used after brief and before coordinator, project, and user modes")
+        command.add_argument("--coordinator-mode", choices=MODES,
+                             help="coordinator mode; used after brief and session, before project and user modes")
     check_brief = sub.add_parser("check-brief")
     check_brief.add_argument("brief", help="brief file to check")
     args = parser.parse_args(argv)
@@ -1189,6 +1456,7 @@ def main(argv=None):
             "write": command_write,
             "bounded-seat": command_bounded_seat,
             "check-brief": command_check_brief,
+            "mode": command_mode,
         }[args.command](args) or 0
     except ModeSettingsError as error:
         print(f"error: {error}", file=sys.stderr)
