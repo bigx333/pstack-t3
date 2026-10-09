@@ -326,6 +326,13 @@ Two writers never share a checkout (principle-separate-before-serializing-shared
 - Uncommitted changes are not copied into new worktrees. Commit or stash first, or point the brief at a pushed branch.
 - T3 runs the first effective project action with `runOnSettle: true` each time a thread settles in its own worktree, including auto-settlement. A thread in the main checkout skips it. The effective list is the project's override, else the environment defaults. Actions in a repository `t3.json` count only once imported into project settings, and either list can replace them. `t3_project_read` returns the project's saved `scripts`, which can differ from the effective list. Before you settle a worktree thread, read T3's `settings.json` (`~/.t3/userdata/settings.json` by default). Take `projectSettingsOverrides.<projectId>.defaultProjectScripts` when present, else `defaultProjectScripts`, and name its first `runOnSettle: true` action or none. When `projectSettingsFolded` is not `true`, older saved lists still count, so treat the action as unknown. The action can run beside another terminal command. Its terminal closes on success and stays open on failure. It is a cleanup hook, not a wake, so never schedule a tick to watch for it.
 
+## Local command capacity
+
+Children, launched threads, and this thread run on this machine, so their builds and tests share its cores. Run each local build, test suite, and verifier rerun through `python3 <skills>/landing/scripts/land.py slot -- <command>`, where `<skills>` is the directory that holds `<pstack-runtime>`. Run each benchmark or timing measurement through `python3 <skills>/landing/scripts/land.py slot --exclusive -- <command>`. It must be the outermost slot. The slot count, its config file, and the landing queue's reserved slot are in the landing skill's [Capacity](../landing/SKILL.md#capacity) section. A brief links that section and does not copy them.
+
+- A slot wraps one command and ends when that command exits. Never hold a slot across a model turn, a `t3_thread_wait`, a `task_status` check, a `watch_pull_request` wait, or any other wait on children. Start dev servers with the preview tools, not in a slot.
+- Slots limit heavy commands, not agents. Do not cap owners, children, or launched threads at the slot count.
+
 ## Top-level threads
 
 Create top-level threads only when the user asked for separate threads or invoked a playbook or skill that names them (Orchestrate, Autopilot-full, Autopilot-stack, brigade). Invoking those is that request. Everything else uses child tasks.
@@ -347,6 +354,7 @@ Create top-level threads only when the user asked for separate threads or invoke
 - `t3_thread_launch` has no retry key. Retain the `threadId`. After an error or lost response, check `t3_thread_list` before retrying. Report it to the user as a thread link per [History](#history).
 - Follow a thread with `t3_thread_wait` and read it with `t3_thread_read` (use `afterPosition` to read only what is new). Send follow-ups with `t3_thread_send`, interrupt with `t3_thread_interrupt`.
 - A thread launched with `t3_thread_launch` has no parent. Its finished turn does not wake the launcher. A launcher that needs a report names the message the launched thread sends with `t3_thread_send`.
+- Autopilot-full, Autopilot-stack, and Orchestrate owners send their report lines to the root or coordinator with `t3_thread_send` and `mode: "auto"`. `auto` starts an idle recipient, steers a fully active turn, and queues behind a turn that cannot accept steering yet. It does not merge reports into one turn. The recipient handles every report, steered or queued, and runs the playbook's head-specific checks on the head each report names. Arrival order never makes a head current. Brigade's event lines to an executive admin stay on `mode: "queue"`, as [Reporting to an executive admin](../brigade/SKILL.md#reporting-to-an-executive-admin) states.
 - `create_threads` makes up to 20 threads sharing this checkout. Use it only for read-only fan-out the user wants visible as threads.
 
 ## Scheduling
@@ -362,6 +370,11 @@ Create top-level threads only when the user asked for separate threads or invoke
 - The tick prompt must stand alone. Point it at the work log or store so a run can rebuild state from disk.
 - Report the returned cadence and `nextRunAt`. Delete the schedule with `delete_scheduled_task` when the done predicate holds. List with `list_scheduled_tasks`.
 - Pause a schedule with `update_scheduled_task` and `enabled: false`. Resume by setting it back to true.
+- A finite program pauses a schedule that can only repeat an unanswered user decision. A finite program has a done predicate, as in Autopilot-full, Autopilot-stack, Orchestrate, and Autonomous run. The rule covers an audit or progress schedule when no item has runnable work and its next run can only raise the same user decision again.
+- Write the decision and that schedule's ID to the work log or store the tick prompt names. Raise the decision once. Then call `update_scheduled_task` with that ID and `enabled: false`, and end the turn.
+- On an answer that permits work, call `update_scheduled_task` with the same ID and `enabled: true`. On an answer that keeps the work parked, record the answer and leave the schedule paused. When the done predicate holds, delete the schedule with `delete_scheduled_task`. After a T3 restart, find the paused schedule with `list_scheduled_tasks` and the recorded ID.
+- A tick queued before the pause can still run after it. It reads the record, does not raise the decision again, and does not re-enable the schedule.
+- Never pause a schedule that renews a lease, drains queued work, consumes standing intake, or notices a merge. A required merge heartbeat and a fallback heartbeat beside `watch_pull_request` keep running. This rule never pauses a brigade schedule. Brigade holds an item on a decision and keeps its liveness schedule renewing the lease.
 - Do not schedule a tick to wait for a child task. Child completions wake this thread, and [Delegation](#delegation) step 5 bounds the wait for a child that never completes.
 - Do not schedule a tick to wait on a pull request's checks, reviews, or conflicts. That wait is [Pull request watching](#pull-request-watching). Keep `schedule_task` for a cadence with no PR event. Beside a watch, a fallback heartbeat uses `everyMs` of at least `3600000`. A required heartbeat whose job is to notice a merge may use `900000`, as that section states.
 
