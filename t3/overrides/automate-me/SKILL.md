@@ -12,6 +12,8 @@ This skill orchestrates three others: an inline mining pass (see step 1), the [`
 
 ## Flow
 
+[The runtime's Modes section](../pstack-runtime/SKILL.md#modes) sets the mode lines of every brief this skill writes and how its spawns run in light mode.
+
 ### 0. Check for an existing skill
 
 Look recursively for `*-mode/SKILL.md` matching the user's handle in every place a T3 provider loads skills from (table in step 4), plus `~/.config/pstack-t3/personal/`. In the project, check `.claude/skills/**` and `.agents/skills/**`. Mode skills can live in a personal category directory (`<skills dir>/<handle>/`), not only at the top level. Resolve symlinks (`readlink -f`) so one skill linked into four provider dirs counts once, and edit its real file. If one exists, confirm intent with the host's question tool (unless they already said "update my skill" or similar):
@@ -28,7 +30,7 @@ Update mode changes the rest of the flow:
 
 Locate the current project's T3 threads before fanning out. List them with `t3_thread_list` (newest first, paged by `cursor`, `settled: true` for threads moved out of the active list) and keep the `threadId`s in the window. T3's thread tools stay inside the current project. Don't ask the user to attach threads from unrelated projects unless they offer. That reads private chats from unrelated work.
 
-Survey recent agent conversations within that scope for recurring patterns. Run multiple parallel children with `delegate_task` (`mode: "async"`, `role: "research"`, a read-only brief) across slices of history (e.g. last 2-4 weeks, split into 3 slices so each has enough material). Each slice mining child gets its slice of `threadId`s from the parent, reads them with `t3_thread_read` (`view: "messages"`, paged with `afterPosition`), looks for the signals below, and returns a short structured list of patterns it saw with `threadId` evidence pointers. Default signals worth hunting:
+Survey recent agent conversations within that scope for recurring patterns. Run multiple parallel children with `delegate_task` (`mode: "async"`, `role: "research"`, a read-only brief) across slices of history (e.g. last 2-4 weeks, split into 3 slices so each has enough material). Each mining child's brief lists every `threadId` in its assignment, and the child reads each one. An assignment is never a sample or a pick of the relevant threads. It reads with `t3_thread_read` (`view: "messages"`, paged with `afterPosition`), looks for the signals below, and returns a short structured list of patterns it saw with `threadId` evidence pointers. Default signals worth hunting:
 
 - Response preferences (length, tone, format, "dumb it down" corrections)
 - Delegation habits (subagents, models, specialized workflows, parallelism)

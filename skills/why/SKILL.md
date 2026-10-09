@@ -13,6 +13,8 @@ Companion to the `how` skill. `how` answers what the code does and how it works.
 
 Each spawn below names a role. Resolve its seat per the [runtime's Roles section](../pstack-runtime/SKILL.md#roles) and spawn with `delegate_task`. Omit `target` for an `inherit` seat. If T3 rejects a target, fall back per the runtime and say which seat changed.
 
+[The runtime's Modes section](../pstack-runtime/SKILL.md#modes) sets the mode lines of every brief this skill writes and how its spawns run in light mode.
+
 ## Operating Posture
 
 Operate as a **careful, cautious, and precise investigator**. Be honest about what you know vs what you're inferring. Read `references/epistemics.md` for the full confidence framework and phrasing guide. The synthesizer must follow it.
@@ -128,7 +130,7 @@ If your scope assessment suggests a single-commit trivial target where the PR de
 
 Spawn one synthesizer child:
 
-- `delegate_task` with `role: "research"` and `title: "why synthesizer"`. Use `mode: "async"` and end the turn, or `mode: "wait"` when presenting is the only step left.
+- `delegate_task` with `role: "research"` and `title: "why synthesizer"`. Use `mode: "async"` and collect it per [the runtime's Delegation step 5](../pstack-runtime/SKILL.md#delegation), or `mode: "wait"` when presenting is the only step left.
 - `target`: the `why synthesizer` role's seat
 - A read-only brief. The synthesizer's quality check spot-verifies citations, which can require MCP access, so keep its tools and put "do not edit files, commit, or push" in the brief.
 

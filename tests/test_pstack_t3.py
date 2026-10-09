@@ -1,9 +1,11 @@
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 
@@ -21,13 +23,155 @@ def config(budget="default", **assigned):
     return {"budget": budget, "roles": assigned, "sources": {name: "test" for name in assigned}}
 
 
+GROK_SEAT = {"providerInstanceId": "grok", "model": "grok-4.7", "options": {"reasoningEffort": "xhigh"}}
+OPUS_SEAT = {"providerInstanceId": "claudeAgent", "model": "claude-opus-5-5", "options": {"effort": "xhigh"}}
+CODE_ROLES = (
+    "feature, refactoring", "bug-fix", "perf-issue", "hillclimb",
+    "swarm workers", "how explorer", "why investigators", "reflect tooling",
+)
+JUDGMENT_ROLES = (
+    "judgment and prose", "hardest tasks", "how explainer", "why synthesizer",
+    "reflect judgment, divergent, synthesizer",
+)
+PANEL_ROLES = ("arena runners", "arena cross-judge pool", "architect runners", "interrogate reviewers")
+
+
 class RolesTest(unittest.TestCase):
-    def test_single_roles_default_to_inherit(self):
-        result = roles.resolve(config(), CATALOG, ["swarm workers"])
-        self.assertEqual(result["roles"]["swarm workers"]["seats"], ["inherit"])
+    def test_fixture_defaults_are_grok_for_code_and_opus_for_judgment(self):
+        for name in CODE_ROLES:
+            entry = roles.resolve(config(), CATALOG, [name])["roles"][name]
+            self.assertEqual(entry["seats"], [GROK_SEAT], name)
+            self.assertNotIn("notes", entry, name)
+        for name in JUDGMENT_ROLES:
+            entry = roles.resolve(config(), CATALOG, [name])["roles"][name]
+            self.assertEqual(entry["seats"], [OPUS_SEAT], name)
+            self.assertNotIn("notes", entry, name)
+        for name in PANEL_ROLES:
+            entry = roles.resolve(config(), CATALOG, [name])["roles"][name]
+            self.assertEqual(entry["seats"], [OPUS_SEAT, GROK_SEAT], name)
+            self.assertNotIn("notes", entry, name)
+
+    def test_every_role_has_one_default_policy(self):
+        self.assertEqual(set(roles.ROLE_DEFAULTS), set(roles.ROLES))
+        for name in roles.SINGLE_ROLES:
+            policy = roles.ROLE_DEFAULTS[name]
+            if name == "skill tests":
+                self.assertIs(policy, roles.AdaptiveDefault.SKILL_TESTS)
+            else:
+                self.assertEqual(len(policy), 1)
+        for name in roles.PANEL_ROLES:
+            policy = roles.ROLE_DEFAULTS[name]
+            if name == "verifiers":
+                self.assertIs(policy, roles.AdaptiveDefault.VERIFIERS)
+            else:
+                self.assertEqual(len(policy), 2)
+
+    def test_setup_examples_match_resolved_fixture_defaults(self):
+        text = (ROOT / "t3/setup.md").read_text()
+        examples = re.findall(r'--set "([^"]+)"', text)
+        self.assertEqual(examples, [
+            "judgment and prose=claudeAgent/claude-opus-5-5?effort=xhigh",
+            "swarm workers=grok/grok-4.7?reasoningEffort=xhigh",
+            "interrogate reviewers=claudeAgent/claude-opus-5-5?effort=xhigh;grok/grok-4.7?reasoningEffort=xhigh",
+        ])
+        for example in examples:
+            name, value = example.split("=", 1)
+            expected = [roles.parse_seat(part) for part in value.split(";")]
+            entry = roles.resolve(config(), CATALOG, [name])["roles"][name]
+            self.assertEqual(entry["seats"], expected, name)
+            self.assertNotIn("notes", entry, name)
+
+    def test_show_prints_the_builtin_bug_fix_seat(self):
+        with tempfile.TemporaryDirectory() as directory:
+            env = {**os.environ, "XDG_CONFIG_HOME": directory}
+            completed = subprocess.run(
+                [sys.executable, str(ROOT / "t3/scripts/roles.py"), "show", "--cwd", directory,
+                 "--catalog", str(ROOT / "tests/fixtures/catalog.json"), "--role", "bug-fix",
+                 "--parent", "claudeAgent/claude-opus-5-5"],
+                env=env, capture_output=True, text=True, check=True)
+        entry = json.loads(completed.stdout)["roles"]["bug-fix"]
+        self.assertEqual(entry["seats"], [GROK_SEAT])
+        self.assertEqual(entry["source"], "default")
+
+    def test_preferred_seat_matching_the_parent_stays_explicit(self):
+        catalog = {**CATALOG, "inheritedProviderInstanceId": "grok", "inheritedModel": "grok-4.7"}
+        entry = roles.resolve(config(), catalog, ["bug-fix"])["roles"]["bug-fix"]
+        self.assertEqual(entry["seats"], [GROK_SEAT])
+        self.assertNotIn("notes", entry)
+
+    def test_skill_tests_default_is_one_other_family_seat(self):
+        entry = roles.resolve(config(), CATALOG, ["skill tests"])["roles"]["skill tests"]
+        self.assertEqual(entry["source"], "default")
+        self.assertEqual(entry["seats"], [{"providerInstanceId": "codex", "model": "gpt-6-luna"}])
+
+    def test_skill_tests_small_budget_caps_the_seat(self):
+        seats = roles.resolve(config("small"), CATALOG, ["skill tests"])["roles"]["skill tests"]["seats"]
+        self.assertEqual(seats, [{"providerInstanceId": "codex", "model": "gpt-6-luna", "options": {"reasoningEffort": "medium"}}])
+
+    def test_skill_tests_falls_back_to_another_family_flagship_when_no_small_tier_exists(self):
+        catalog = {
+            "inheritedProviderInstanceId": "claudeAgent",
+            "inheritedModel": "claude-opus-5-5",
+            "providers": [
+                {"providerInstanceId": "claudeAgent", "canRunChildTask": True, "constraints": [],
+                 "models": [{"id": "claude-opus-5-5", "options": []}]},
+                {"providerInstanceId": "codex", "canRunChildTask": True, "constraints": [],
+                 "models": [
+                     {"id": "gpt-6-terra", "options": [{"id": "reasoningEffort", "type": "select", "options": [{"id": "medium", "isDefault": True}, {"id": "high"}]}]},
+                     {"id": "gpt-6.1-sol", "options": [{"id": "reasoningEffort", "type": "select", "options": [{"id": "low", "isDefault": True}, {"id": "medium"}, {"id": "high"}]}]},
+                 ]},
+            ],
+        }
+        seats = roles.resolve(config(), catalog, ["skill tests"])["roles"]["skill tests"]["seats"]
+        self.assertEqual(seats, [{"providerInstanceId": "codex", "model": "gpt-6.1-sol"}])
+
+    def test_runtime_lists_the_same_small_tier_tokens(self):
+        text = (ROOT / "t3/runtime.md").read_text()
+        match = re.search(r"prefer an id token in (.+?), then the lowest", text)
+        self.assertIsNotNone(match)
+        named = re.findall(r"`([a-z]+)`", match.group(1))
+        self.assertEqual(set(named), set(roles.SMALL_TIER))
+
+    def test_skill_tests_uses_a_small_model_inside_the_only_family(self):
+        catalog = {**CATALOG, "providers": [p for p in CATALOG["providers"] if p["providerInstanceId"] == "claudeAgent"]}
+        seat = {"providerInstanceId": "claudeAgent", "model": "claude-haiku-4-5"}
+        note = "claude-haiku-5-5 is capped; roles.py bounded-seat launches it when the whole prompt fits"
+        entry = roles.resolve(config(), catalog, ["skill tests"])["roles"]["skill tests"]
+        self.assertEqual(entry["seats"], [seat])
+        self.assertEqual(entry["note"], note)
+        capped = roles.resolve(config("small"), catalog, ["skill tests"])["roles"]["skill tests"]
+        self.assertEqual(capped["seats"], [seat])
+        self.assertEqual(capped["note"], note)
+
+    def test_skill_tests_without_a_catalog_asks_for_one_when_the_parent_is_capped(self):
+        plain = roles.resolve(config(), None, ["skill tests"])["roles"]["skill tests"]
+        self.assertEqual(plain["seats"], ["inherit"])
+        self.assertNotIn("note", plain)
+        note = "claude-haiku-5-5 is capped; roles.py bounded-seat launches it when the whole prompt fits"
+        inherited = roles.resolve(
+            config(), None, ["skill tests"], roles.Parent("claudeAgent", "claude-haiku-5-5"),
+        )["roles"]["skill tests"]
+        self.assertEqual(inherited["seats"], "catalog-required")
+        self.assertEqual(inherited["note"], note)
+        stored = roles.resolve(
+            config(**{"skill tests": [{"providerInstanceId": "cursor", "model": "claude-haiku-5-5"}]}),
+            None,
+            ["skill tests"],
+        )["roles"]["skill tests"]
+        self.assertEqual(stored["seats"], "catalog-required")
+        self.assertEqual(stored["note"], note)
+
+    def test_runtime_role_table_lists_the_same_names_as_the_role_list(self):
+        text = (ROOT / "t3/runtime.md").read_text()
+        section = text.split("### Role names", 1)[1].split("### Built-in defaults", 1)[0]
+        names = re.findall(r"\| `([^`]+)` \|", section)
+        self.assertEqual(sorted(names), sorted(roles.ROLES))
+        self.assertEqual(len(names), len(set(names)))
+        proposals = (ROOT / "t3/setup.md").read_text().split("**(b) Propose roles.**", 1)[1].split("**(c) Confirm.**", 1)[0]
+        self.assertIn("`skill tests`", proposals)
 
     def test_panel_default_is_one_seat_per_runnable_provider_with_parent_inheriting(self):
-        seats = roles.resolve(config(), CATALOG, ["interrogate reviewers"])["roles"]["interrogate reviewers"]["seats"]
+        seats = roles.resolve(config(), CATALOG, ["verifiers"])["roles"]["verifiers"]["seats"]
         self.assertEqual(seats, [
             "inherit",
             {"providerInstanceId": "codex", "model": "gpt-6.1-sol"},
@@ -54,12 +198,121 @@ class RolesTest(unittest.TestCase):
         self.assertEqual(len(problems), 2, problems)
 
     def test_budget_makes_inherit_explicit_so_the_cap_applies(self):
-        seats = roles.resolve(config("small"), CATALOG, ["bug-fix"])["roles"]["bug-fix"]["seats"]
+        seats = roles.resolve(config("small", **{"bug-fix": ["inherit"]}), CATALOG, ["bug-fix"])["roles"]["bug-fix"]["seats"]
         self.assertEqual(seats, [{"providerInstanceId": "claudeAgent", "model": "claude-opus-5-5", "options": {"effort": "medium"}}])
-        self.assertEqual(roles.resolve(config(), CATALOG, ["bug-fix"])["roles"]["bug-fix"]["seats"], ["inherit"])
-        entry = roles.resolve(config("small"), CATALOG, ["bug-fix"])["roles"]["bug-fix"]
+        entry = roles.resolve(config("small", **{"bug-fix": ["inherit"]}), CATALOG, ["bug-fix"])["roles"]["bug-fix"]
         self.assertNotIn("notes", entry)
         self.assertIn("inherit made explicit", entry["info"][0])
+        plain = roles.resolve(config(), CATALOG, ["bug-fix"])["roles"]["bug-fix"]["seats"]
+        self.assertEqual(plain, [GROK_SEAT])
+        capped = roles.resolve(config("small"), CATALOG, ["bug-fix"])["roles"]["bug-fix"]["seats"]
+        self.assertEqual(capped, [{"providerInstanceId": "grok", "model": "grok-4.7", "options": {"reasoningEffort": "medium"}}])
+
+    def test_unlimited_budget_raises_builtin_seats_to_the_highest_non_special_level(self):
+        grok = roles.resolve(config("unlimited"), CATALOG, ["bug-fix"])["roles"]["bug-fix"]["seats"]
+        self.assertEqual(grok, [GROK_SEAT])
+        opus_max = {"providerInstanceId": "claudeAgent", "model": "claude-opus-5-5", "options": {"effort": "max"}}
+        judgment = roles.resolve(config("unlimited"), CATALOG, ["judgment and prose"])["roles"]["judgment and prose"]["seats"]
+        self.assertEqual(judgment, [opus_max])
+        panel = roles.resolve(config("unlimited"), CATALOG, ["interrogate reviewers"])["roles"]["interrogate reviewers"]["seats"]
+        self.assertEqual(panel, [opus_max, GROK_SEAT])
+        verifiers = roles.resolve(config("unlimited"), CATALOG, ["verifiers"])["roles"]["verifiers"]["seats"]
+        self.assertEqual(verifiers[0], opus_max)
+        self.assertEqual(verifiers[2]["options"]["reasoningEffort"], "xhigh")
+        named = {"providerInstanceId": "claudeAgent", "model": "claude-opus-5-5", "options": {"effort": "xhigh"}}
+        kept = roles.resolve(config("unlimited", **{"judgment and prose": [named]}), CATALOG, ["judgment and prose"])["roles"]["judgment and prose"]["seats"]
+        self.assertEqual(kept, [named])
+
+    def test_unlimited_with_no_grok_stops_at_max_on_a_codex_parent(self):
+        providers = [provider for provider in CATALOG["providers"] if provider["providerInstanceId"] != "grok"]
+        catalog = {
+            **CATALOG,
+            "providers": providers,
+            "inheritedProviderInstanceId": "codex",
+            "inheritedModel": "gpt-6.1-sol",
+        }
+        codex_max = {"providerInstanceId": "codex", "model": "gpt-6.1-sol", "options": {"reasoningEffort": "max"}}
+        for name in CODE_ROLES:
+            seats = roles.resolve(config("unlimited"), catalog, [name])["roles"][name]["seats"]
+            self.assertEqual(seats, [codex_max], name)
+        panel = roles.resolve(config("unlimited"), catalog, ["interrogate reviewers"])["roles"]["interrogate reviewers"]["seats"]
+        self.assertEqual(panel[1], codex_max)
+        explicit = {"providerInstanceId": "codex", "model": "gpt-6.1-sol", "options": {"reasoningEffort": "ultra"}}
+        capped = roles.resolve(config("unlimited", **{"bug-fix": [explicit]}), catalog, ["bug-fix"])["roles"]["bug-fix"]["seats"]
+        self.assertEqual(capped, [codex_max])
+        verifiers = roles.resolve(config("unlimited"), catalog, ["verifiers"])["roles"]["verifiers"]["seats"]
+        self.assertEqual(verifiers[0], codex_max)
+        self.assertNotIn("ultra", json.dumps(verifiers))
+        full = roles.resolve(config("unlimited"), CATALOG, ["verifiers"])["roles"]["verifiers"]["seats"]
+        self.assertEqual(full[1]["options"]["reasoningEffort"], "max")
+
+    def test_show_writes_ultra_under_every_budget_when_it_is_the_only_level(self):
+        only_ultra = {
+            "inheritedProviderInstanceId": "codex",
+            "inheritedModel": "gpt-6.1-sol",
+            "providers": [{
+                "providerInstanceId": "codex", "canRunChildTask": True, "constraints": [],
+                "models": [{"id": "gpt-6.1-sol", "options": [
+                    {"id": "reasoningEffort", "type": "select", "options": [{"id": "ultra"}]},
+                ]}],
+            }],
+        }
+        ultra = {"providerInstanceId": "codex", "model": "gpt-6.1-sol", "options": {"reasoningEffort": "ultra"}}
+        codex_max = {"providerInstanceId": "codex", "model": "gpt-6.1-sol", "options": {"reasoningEffort": "max"}}
+
+        def show(budget, catalog, seat=None):
+            with tempfile.TemporaryDirectory() as directory:
+                roles_file = Path(directory) / "pstack-t3" / "roles.json"
+                roles_file.parent.mkdir()
+                roles_file.write_text(json.dumps({"version": 1, "budget": budget, "roles": {"bug-fix": [seat]} if seat else {}}))
+                completed = subprocess.run(
+                    [sys.executable, str(ROOT / "t3/scripts/roles.py"), "show", "--cwd", directory,
+                     "--catalog", "-", "--parent", "codex/gpt-6.1-sol", "--role", "bug-fix"],
+                    input=json.dumps(catalog), env={**os.environ, "XDG_CONFIG_HOME": directory},
+                    capture_output=True, text=True, check=True)
+            return json.loads(completed.stdout)["roles"]["bug-fix"]["seats"]
+
+        for budget in ("default", "small", "medium", "large", "unlimited"):
+            self.assertEqual(show(budget, only_ultra), [ultra], budget)
+            self.assertEqual(show(budget, only_ultra, ultra), [ultra], budget)
+        self.assertEqual(show("default", CATALOG, ultra), [ultra])
+        self.assertEqual(show("unlimited", CATALOG, ultra), [codex_max])
+
+    def test_catalog_stdin_matches_the_file_error_and_accepts_json(self):
+        script = [sys.executable, str(ROOT / "t3/scripts/roles.py"), "show", "--role", "bug-fix", "--parent", "claudeAgent/claude-opus-5-5"]
+        catalog_text = (ROOT / "tests/fixtures/catalog.json").read_text()
+
+        def detail(stderr):
+            line = stderr.strip().splitlines()[-1]
+            self.assertTrue(line.startswith("error: "), stderr)
+            self.assertIn("invalid JSON: ", line)
+            return line.split("invalid JSON: ", 1)[1]
+
+        with tempfile.TemporaryDirectory() as directory:
+            env = {**os.environ, "XDG_CONFIG_HOME": directory}
+            base = [*script, "--cwd", directory]
+
+            def run(catalog_arg, stdin=""):
+                return subprocess.run([*base, "--catalog", catalog_arg], input=stdin, capture_output=True, text=True, env=env)
+
+            valid_stdin = run("-", catalog_text)
+            self.assertEqual(valid_stdin.returncode, 0, valid_stdin.stderr)
+            valid_file = run(str(ROOT / "tests/fixtures/catalog.json"))
+            self.assertEqual(valid_file.returncode, 0, valid_file.stderr)
+            self.assertEqual(valid_stdin.stdout, valid_file.stdout)
+            self.assertEqual(json.loads(valid_stdin.stdout)["roles"]["bug-fix"]["seats"], [GROK_SEAT])
+
+            bad = Path(directory) / "bad.json"
+            empty = Path(directory) / "empty.json"
+            bad.write_text("{not json")
+            empty.write_text("")
+            for stdin_text, file_path in (("", empty), ("{not json", bad)):
+                from_stdin = run("-", stdin_text)
+                from_file = run(str(file_path))
+                self.assertEqual(from_stdin.returncode, 2, from_stdin.stderr)
+                self.assertEqual(from_file.returncode, 2, from_file.stderr)
+                self.assertNotIn("Traceback", from_stdin.stderr)
+                self.assertEqual(detail(from_stdin.stderr), detail(from_file.stderr))
 
     def test_budget_understands_extra_high_and_keeps_none(self):
         model = {"id": "m", "options": [{"id": "reasoning_effort", "type": "select", "options": [{"id": "none"}, {"id": "low"}, {"id": "high"}, {"id": "extra-high"}]}]}
@@ -83,12 +336,42 @@ class RolesTest(unittest.TestCase):
 
     def test_panel_with_one_runnable_provider_is_three_inherit_seats(self):
         catalog = {**CATALOG, "providers": [p for p in CATALOG["providers"] if p["providerInstanceId"] == "claudeAgent"]}
-        seats = roles.resolve(config(), catalog, ["arena runners"])["roles"]["arena runners"]["seats"]
+        seats = roles.resolve(config(), catalog, ["verifiers"])["roles"]["verifiers"]["seats"]
         self.assertEqual(seats, ["inherit", "inherit", "inherit"])
 
+    def test_arena_runners_with_one_runnable_provider_keeps_two_fallback_seats(self):
+        catalog = {**CATALOG, "providers": [p for p in CATALOG["providers"] if p["providerInstanceId"] == "claudeAgent"]}
+        entry = roles.resolve(config(), catalog, ["arena runners"])["roles"]["arena runners"]
+        self.assertEqual(entry["seats"], [OPUS_SEAT, OPUS_SEAT])
+        self.assertNotIn("fastMode", entry["seats"][1].get("options", {}))
+        self.assertEqual(entry["notes"], [
+            "arena runners seat 2: wanted grok-4.7, using claudeAgent/claude-opus-5-5 (missing family)",
+            "arena runners: seats 1 and 2 both use claudeAgent/claude-opus-5-5, so the panel lost a distinct model",
+        ])
+
     def test_without_catalog_panels_are_reported_for_the_agent_to_expand(self):
-        entry = roles.resolve(config(), None, ["verifiers"])["roles"]["verifiers"]
-        self.assertEqual(entry["seats"], "default-panel")
+        note = (
+            "expand from orchestrator_capabilities: this thread inherits, "
+            "then one seat per runnable provider whose first model is a new model family"
+        )
+        unknown = roles.resolve(config(), None, ["verifiers"])["roles"]["verifiers"]
+        self.assertEqual(unknown["seats"], "default-panel")
+        self.assertEqual(unknown["note"], note)
+        named = roles.resolve(config(), None, ["verifiers"], roles.Parent("grok", "grok-4.7"))["roles"]["verifiers"]
+        self.assertEqual(named["seats"], "default-panel")
+        self.assertEqual(named["note"], note)
+
+    def test_preferred_roles_without_a_catalog_ask_for_one(self):
+        entry = roles.resolve(config(), None, ["bug-fix"])["roles"]["bug-fix"]
+        self.assertEqual(entry["seats"], "catalog-required")
+        self.assertEqual(entry["note"], "call orchestrator_capabilities and rerun roles.py show --catalog")
+        panel = roles.resolve(config(), None, ["arena runners"])["roles"]["arena runners"]
+        self.assertEqual(panel["seats"], "catalog-required")
+        skill = roles.resolve(config(), None, ["skill tests"])["roles"]["skill tests"]
+        self.assertEqual(skill["seats"], ["inherit"])
+        self.assertNotIn("note", skill)
+        inherited = roles.resolve(config(**{"bug-fix": ["inherit"]}), None, ["bug-fix"])["roles"]["bug-fix"]
+        self.assertEqual(inherited["seats"], ["inherit"])
 
     def test_unrunnable_provider_falls_back_to_inherit_with_a_note(self):
         entry = roles.resolve(config(**{"swarm workers": [{"providerInstanceId": "cursor", "model": "default"}]}), CATALOG, ["swarm workers"])["roles"]["swarm workers"]
@@ -175,6 +458,406 @@ class RolesTest(unittest.TestCase):
             self.assertEqual(roles.main(args), 0)
             self.assertEqual(target.read_text(), first)
             self.assertEqual(json.loads(first)["roles"]["interrogate reviewers"][1]["model"], "gpt-6.1-sol")
+
+    def test_missing_grok_model_names_the_replacement(self):
+        grok = {
+            "providerInstanceId": "grok", "canRunChildTask": True, "constraints": [],
+            "models": [{"id": "grok-4.5", "options": [{"id": "reasoningEffort", "type": "select", "options": [
+                {"id": "xhigh"}, {"id": "high"}, {"id": "medium"}, {"id": "low"}]}]}],
+        }
+        providers = [grok if provider["providerInstanceId"] == "grok" else provider for provider in CATALOG["providers"]]
+        entry = roles.resolve(config(), {**CATALOG, "providers": providers}, ["swarm workers"])["roles"]["swarm workers"]
+        self.assertEqual(entry["seats"], [{"providerInstanceId": "grok", "model": "grok-4.5", "options": {"reasoningEffort": "xhigh"}}])
+        self.assertEqual(entry["notes"], ["swarm workers seat 1: wanted grok-4.7, using grok/grok-4.5 (missing model)"])
+
+    def test_codex_only_catalog_substitutes_both_panel_seats(self):
+        codex = next(provider for provider in CATALOG["providers"] if provider["providerInstanceId"] == "codex")
+        catalog = {"inheritedProviderInstanceId": "codex", "inheritedModel": "gpt-6.1-sol", "providers": [codex]}
+        entry = roles.resolve(config(), catalog, ["interrogate reviewers"])["roles"]["interrogate reviewers"]
+        seat = {"providerInstanceId": "codex", "model": "gpt-6.1-sol", "options": {"reasoningEffort": "xhigh"}}
+        self.assertEqual(entry["seats"], [seat, seat])
+        self.assertEqual(entry["notes"], [
+            "interrogate reviewers seat 1: wanted claude-opus-5-5, using codex/gpt-6.1-sol (missing family)",
+            "interrogate reviewers seat 2: wanted grok-4.7, using codex/gpt-6.1-sol (missing family)",
+            "interrogate reviewers: seats 1 and 2 both use codex/gpt-6.1-sol, so the panel lost a distinct model",
+        ])
+
+    def test_no_runnable_model_raises(self):
+        catalog = {"providers": [{"providerInstanceId": "cursor", "canRunChildTask": False,
+                                  "constraints": ["Provider is not authenticated."], "models": [{"id": "default", "options": []}]}]}
+        for name in ("bug-fix", "verifiers"):
+            with self.assertRaises(roles.RolesError) as caught:
+                roles.resolve(config(), catalog, [name])
+            self.assertIn("no provider in the catalog can run child tasks", str(caught.exception))
+
+    def test_custom_runnable_provider_serves_a_preferred_model(self):
+        grok = next(provider for provider in CATALOG["providers"] if provider["providerInstanceId"] == "grok")
+        blocked = {**grok, "canRunChildTask": False, "constraints": ["Provider is not authenticated."]}
+        custom = {
+            "providerInstanceId": "acme", "canRunChildTask": True, "constraints": [],
+            "models": [{"id": "grok-4.7", "options": [
+                {"id": "reasoningEffort", "type": "select", "options": [{"id": "xhigh"}, {"id": "high"}]},
+                {"id": "fastMode", "type": "boolean"},
+            ]}],
+        }
+        providers = [blocked if provider["providerInstanceId"] == "grok" else provider for provider in CATALOG["providers"]]
+        providers.append(custom)
+        entry = roles.resolve(config(), {**CATALOG, "providers": providers}, ["swarm workers"])["roles"]["swarm workers"]
+        self.assertEqual(entry["seats"], [{"providerInstanceId": "acme", "model": "grok-4.7", "options": {"reasoningEffort": "xhigh", "fastMode": False}}])
+        self.assertNotIn("notes", entry)
+
+    def test_unauthenticated_only_copy_falls_back_to_the_parent(self):
+        grok = next(provider for provider in CATALOG["providers"] if provider["providerInstanceId"] == "grok")
+        blocked = {**grok, "canRunChildTask": False, "constraints": ["Provider is not authenticated."]}
+        providers = [blocked if provider["providerInstanceId"] == "grok" else provider for provider in CATALOG["providers"]]
+        entry = roles.resolve(config(), {**CATALOG, "providers": providers}, ["swarm workers"])["roles"]["swarm workers"]
+        self.assertEqual(entry["seats"], [OPUS_SEAT])
+        self.assertNotIn("fastMode", entry["seats"][0]["options"])
+        self.assertEqual(entry["notes"], ["swarm workers seat 1: wanted grok-4.7, using claudeAgent/claude-opus-5-5 (missing family)"])
+
+    def test_claude_and_codex_catalog_without_grok_does_not_set_fast_mode(self):
+        providers = [provider for provider in CATALOG["providers"] if provider["providerInstanceId"] in ("claudeAgent", "codex")]
+        catalog = {**CATALOG, "providers": providers}
+        entry = roles.resolve(config(), catalog, ["bug-fix"])["roles"]["bug-fix"]
+        self.assertEqual(entry["seats"], [OPUS_SEAT])
+        self.assertNotIn("fastMode", entry["seats"][0]["options"])
+        self.assertIn("missing family", entry["notes"][0])
+        panel = roles.resolve(config(), catalog, ["interrogate reviewers"])["roles"]["interrogate reviewers"]
+        self.assertEqual(panel["seats"][1], OPUS_SEAT)
+        self.assertNotIn("fastMode", panel["seats"][1]["options"])
+
+    def test_exact_model_prefers_the_provider_whose_first_model_is_in_the_family(self):
+        wrapper = {
+            "providerInstanceId": "wrapper", "canRunChildTask": True, "constraints": [],
+            "models": [
+                {"id": "gpt-9", "options": []},
+                {"id": "grok-4.7", "options": [{"id": "reasoningEffort", "type": "select", "options": [{"id": "xhigh"}]}]},
+            ],
+        }
+        grok = next(provider for provider in CATALOG["providers"] if provider["providerInstanceId"] == "grok")
+        providers = [wrapper] + [provider for provider in CATALOG["providers"] if provider["providerInstanceId"] != "grok"] + [grok]
+        entry = roles.resolve(config(), {**CATALOG, "providers": providers}, ["swarm workers"])["roles"]["swarm workers"]
+        self.assertEqual(entry["seats"], [{"providerInstanceId": "grok", "model": "grok-4.7", "options": {"reasoningEffort": "xhigh"}}])
+        self.assertNotIn("notes", entry)
+
+    def test_exact_model_keeps_catalog_order_when_no_first_model_is_in_the_family(self):
+        def carrier(provider_id, first_model):
+            return {
+                "providerInstanceId": provider_id, "canRunChildTask": True, "constraints": [],
+                "models": [
+                    {"id": first_model, "options": []},
+                    {"id": "grok-4.7", "options": [{"id": "reasoningEffort", "type": "select", "options": [{"id": "xhigh"}]}]},
+                ],
+            }
+        providers = [carrier("first", "gpt-9"), carrier("second", "claude-haiku-9")]
+        providers.extend(provider for provider in CATALOG["providers"] if provider["providerInstanceId"] != "grok")
+        entry = roles.resolve(config(), {**CATALOG, "providers": providers}, ["swarm workers"])["roles"]["swarm workers"]
+        self.assertEqual(entry["seats"], [{"providerInstanceId": "first", "model": "grok-4.7", "options": {"reasoningEffort": "xhigh"}}])
+        self.assertNotIn("notes", entry)
+
+    def test_preferred_seat_notes_a_lower_declared_effort(self):
+        grok = {
+            "providerInstanceId": "grok", "canRunChildTask": True, "constraints": [],
+            "models": [{"id": "grok-4.7", "options": [{"id": "reasoningEffort", "type": "select", "options": [
+                {"id": "high"}, {"id": "medium"}, {"id": "low"}]}]}],
+        }
+        providers = [grok if provider["providerInstanceId"] == "grok" else provider for provider in CATALOG["providers"]]
+        entry = roles.resolve(config(), {**CATALOG, "providers": providers}, ["bug-fix"])["roles"]["bug-fix"]
+        self.assertEqual(entry["seats"], [{"providerInstanceId": "grok", "model": "grok-4.7", "options": {"reasoningEffort": "high"}}])
+        self.assertEqual(entry["notes"], ["bug-fix seat 1: wanted xhigh, using high"])
+
+    def test_preferred_seat_adds_no_effort_option_when_the_model_declares_none(self):
+        grok = {"providerInstanceId": "grok", "canRunChildTask": True, "constraints": [], "models": [{"id": "grok-4.7", "options": []}]}
+        providers = [grok if provider["providerInstanceId"] == "grok" else provider for provider in CATALOG["providers"]]
+        entry = roles.resolve(config(), {**CATALOG, "providers": providers}, ["bug-fix"])["roles"]["bug-fix"]
+        self.assertEqual(entry["seats"], [{"providerInstanceId": "grok", "model": "grok-4.7"}])
+        self.assertNotIn("notes", entry)
+
+    def test_extra_high_spelling_satisfies_the_builtin_ceiling(self):
+        grok = {
+            "providerInstanceId": "grok", "canRunChildTask": True, "constraints": [],
+            "models": [{"id": "grok-4.7", "options": [{"id": "reasoningEffort", "type": "select", "options": [
+                {"id": "high"}, {"id": "extra-high"}]}]}],
+        }
+        providers = [grok if provider["providerInstanceId"] == "grok" else provider for provider in CATALOG["providers"]]
+        entry = roles.resolve(config(), {**CATALOG, "providers": providers}, ["bug-fix"])["roles"]["bug-fix"]
+        self.assertEqual(entry["seats"], [{"providerInstanceId": "grok", "model": "grok-4.7", "options": {"reasoningEffort": "extra-high"}}])
+        self.assertNotIn("notes", entry)
+
+    def test_explicit_codex_seat_wins_over_the_builtin(self):
+        seat = {"providerInstanceId": "codex", "model": "gpt-6.1-sol", "options": {"reasoningEffort": "high"}}
+        entry = roles.resolve(config("large", **{"bug-fix": [seat]}), CATALOG, ["bug-fix"])["roles"]["bug-fix"]
+        self.assertEqual(entry["seats"], [seat])
+        self.assertEqual(entry["source"], "test")
+        self.assertNotIn("notes", entry)
+
+    def test_configured_panel_keeps_its_seat_count(self):
+        seats = ["inherit", {"providerInstanceId": "codex", "model": "gpt-6.1-sol"}, {"providerInstanceId": "grok", "model": "grok-4.7"}]
+        entry = roles.resolve(config(**{"interrogate reviewers": seats}), CATALOG, ["interrogate reviewers"])["roles"]["interrogate reviewers"]
+        self.assertEqual(entry["seats"][0], "inherit")
+        self.assertEqual(len(entry["seats"]), 3)
+        self.assertEqual(entry["source"], "test")
+
+    def test_resolve_does_not_mutate_inputs_and_repeats(self):
+        catalog = json.loads(json.dumps(CATALOG))
+        before_catalog = json.dumps(catalog)
+        before_roles = json.dumps(roles.ROLES)
+        cfg = config()
+        before_cfg = json.dumps(cfg)
+        first = roles.resolve(cfg, catalog)
+        second = roles.resolve(cfg, catalog)
+        self.assertEqual(first, second)
+        self.assertEqual(json.dumps(catalog), before_catalog)
+        self.assertEqual(json.dumps(roles.ROLES), before_roles)
+        self.assertEqual(json.dumps(cfg), before_cfg)
+        self.assertEqual([seat.model_id for seat in (roles.OPUS, roles.GROK)], ["claude-opus-5-5", "grok-4.7"])
+
+    def test_runtime_describes_the_builtin_policy(self):
+        text = (ROOT / "t3/runtime.md").read_text()
+        self.assertIn("catalog-required", text)
+        self.assertIn("Do not reconstruct role defaults", text)
+        self.assertNotIn("Expand it yourself", text)
+        self.assertIn("`gpt-6.1-sol` is `gpt`", text)
+        self.assertNotIn('"model": "gpt-6.1-sol"', text)
+        defaults = text.split("### Built-in defaults", 1)[1].split("### Budget", 1)[0]
+        self.assertIn('`verifiers` is three `"inherit"` seats', defaults)
+        self.assertIn("roles.py show` owns this mapping", defaults)
+
+    def test_setup_stops_before_writing_when_watch_is_absent(self):
+        text = (ROOT / "t3/setup.md").read_text()
+        self.assertIn(
+            'Say "Setup cannot finish. T3 Code 0.0.46-nightly.20261005.2702 or later is required because this host does not expose watch_pull_request."',
+            text,
+        )
+        self.assertIn("stop setup before writing roles or a saved catalog", text)
+        self.assertIn("A deferred `watch_pull_request` counts as present", text)
+        self.assertIn("dummy PR", text)
+
+    def test_model_line_and_version_follow_the_bare_id(self):
+        self.assertEqual(roles.model_line("claude-haiku-5-5"), ("claude", "haiku"))
+        self.assertEqual(roles.model_line("claude-haiku-4-5"), ("claude", "haiku"))
+        self.assertEqual(roles.model_line("gpt-6-luna"), ("gpt", "luna"))
+        self.assertEqual(roles.model_line("gpt-5.6-luna"), ("gpt", "luna"))
+        self.assertEqual(roles.model_line("glm-5p3-flash"), ("glm", "flash"))
+        self.assertEqual(roles.model_line("anthropic/claude-haiku-5-5"), ("claude", "haiku"))
+        self.assertEqual(roles.model_version("claude-haiku-5-5"), (5, 5))
+        self.assertEqual(roles.model_version("gpt-6-luna"), (6,))
+        self.assertEqual(roles.model_version("gpt-5.6-luna"), (5, 6))
+        self.assertEqual(roles.model_version("glm-5p3-flash"), (5, 3))
+        self.assertEqual(roles.model_version("anthropic/claude-haiku-5-5"), (5, 5))
+
+    def test_skill_tests_returns_the_uncapped_haiku_on_the_winning_line(self):
+        thinking = [{"id": "thinking", "type": "boolean"}]
+        effort = [{"id": "effort", "type": "select", "options": [{"id": "medium", "isDefault": True}, {"id": "high"}]}]
+        haiku_4 = {"id": "claude-haiku-4-5", "options": thinking}
+        haiku_5 = {"id": "claude-haiku-5-5", "options": effort}
+        catalog = {
+            "inheritedProviderInstanceId": "grok",
+            "inheritedModel": "grok-4.7",
+            "providers": [{
+                "providerInstanceId": "claudeAgent", "canRunChildTask": True, "constraints": [],
+                "models": [haiku_4, haiku_5],
+            }],
+        }
+        entry = roles.resolve(config(), catalog, ["skill tests"])["roles"]["skill tests"]
+        self.assertEqual(entry["seats"], [{"providerInstanceId": "claudeAgent", "model": "claude-haiku-4-5"}])
+        self.assertEqual(
+            entry["note"],
+            "claude-haiku-5-5 is capped; roles.py bounded-seat launches it when the whole prompt fits",
+        )
+
+    def test_skill_tests_picks_gpt_6_luna_over_an_earlier_gpt_5_6_luna(self):
+        effort = [{"id": "reasoningEffort", "type": "select", "options": [{"id": "medium", "isDefault": True}, {"id": "high"}]}]
+        catalog = {
+            "inheritedProviderInstanceId": "claudeAgent",
+            "inheritedModel": "claude-opus-5-5",
+            "providers": [{
+                "providerInstanceId": "codex", "canRunChildTask": True, "constraints": [],
+                "models": [
+                    {"id": "gpt-5.6-luna", "options": effort},
+                    {"id": "gpt-6-luna", "options": effort},
+                ],
+            }],
+        }
+        seats = roles.resolve(config(), catalog, ["skill tests"])["roles"]["skill tests"]["seats"]
+        self.assertEqual(seats, [{"providerInstanceId": "codex", "model": "gpt-6-luna"}])
+
+    def test_provider_prefixed_capped_id_is_refused(self):
+        seat = {"providerInstanceId": "claudeAgent", "model": "anthropic/claude-haiku-5-5"}
+        with self.assertRaises(roles.RolesError) as caught:
+            roles.check_shape({"roles": {"swarm workers": [seat]}}, "roles.json")
+        self.assertEqual(
+            str(caught.exception),
+            "roles.json: role 'swarm workers' cannot use claudeAgent/anthropic/claude-haiku-5-5: "
+            "claude-haiku-5-5 is capped at 100000 prompt tokens, and only skill tests may run a capped model",
+        )
+
+    def test_inherit_of_a_capped_parent_is_refused_outside_skill_tests(self):
+        catalog = {
+            "inheritedProviderInstanceId": "claudeAgent",
+            "inheritedModel": "claude-haiku-5-5",
+            "providers": [{
+                "providerInstanceId": "claudeAgent", "canRunChildTask": True, "constraints": [],
+                "models": [{"id": "claude-haiku-5-5", "options": [
+                    {"id": "effort", "type": "select", "options": [{"id": "medium", "isDefault": True}, {"id": "high"}]},
+                ]}],
+            }],
+        }
+        with self.assertRaises(roles.RolesError) as caught:
+            roles.resolve(config(**{"how explorer": ["inherit"]}), catalog, ["how explorer"])
+        self.assertEqual(
+            str(caught.exception),
+            "role 'how explorer' cannot inherit claudeAgent/claude-haiku-5-5: "
+            "claude-haiku-5-5 is capped at 100000 prompt tokens, and only skill tests may run a capped model",
+        )
+        with self.assertRaises(roles.RolesError) as skill:
+            roles.resolve(config(**{"skill tests": ["inherit"]}), catalog, ["skill tests"])
+        self.assertEqual(
+            str(skill.exception),
+            "role 'skill tests' has no seat: every runnable model in the catalog is capped "
+            "(claude-haiku-5-5 at 100000 prompt tokens), and only skill tests may run a capped model",
+        )
+
+    def test_unrunnable_provider_refuses_to_inherit_a_capped_parent(self):
+        catalog = {
+            "inheritedProviderInstanceId": "claudeAgent",
+            "inheritedModel": "claude-haiku-5-5",
+            "providers": [
+                {"providerInstanceId": "cursor", "canRunChildTask": False,
+                 "constraints": ["Provider is not authenticated."], "models": [{"id": "default", "options": []}]},
+                {"providerInstanceId": "claudeAgent", "canRunChildTask": True, "constraints": [],
+                 "models": [{"id": "claude-haiku-5-5", "options": []}]},
+            ],
+        }
+        with self.assertRaises(roles.RolesError) as caught:
+            roles.resolve(
+                config(**{"swarm workers": [{"providerInstanceId": "cursor", "model": "default"}]}),
+                catalog,
+                ["swarm workers"],
+            )
+        self.assertEqual(
+            str(caught.exception),
+            "role 'swarm workers' cannot inherit claudeAgent/claude-haiku-5-5: "
+            "claude-haiku-5-5 is capped at 100000 prompt tokens, and only skill tests may run a capped model",
+        )
+
+    def test_judgment_skips_a_capped_model_and_uses_the_next_claude_model(self):
+        effort = [{"id": "effort", "type": "select", "options": [{"id": "high", "isDefault": True}, {"id": "xhigh"}]}]
+        catalog = {
+            "inheritedProviderInstanceId": "claudeAgent",
+            "inheritedModel": "claude-haiku-5-5",
+            "providers": [{
+                "providerInstanceId": "claudeAgent", "canRunChildTask": True, "constraints": [],
+                "models": [
+                    {"id": "claude-haiku-5-5", "options": effort},
+                    {"id": "claude-sonnet-5-5", "options": effort},
+                ],
+            }],
+        }
+        entry = roles.resolve(config(), catalog, ["judgment and prose"])["roles"]["judgment and prose"]
+        self.assertEqual(entry["seats"], [{
+            "providerInstanceId": "claudeAgent",
+            "model": "claude-sonnet-5-5",
+            "options": {"effort": "xhigh"},
+        }])
+        self.assertEqual(entry["notes"], [
+            "judgment and prose seat 1: wanted claude-opus-5-5, using claudeAgent/claude-sonnet-5-5 (missing model)",
+        ])
+
+    def test_missing_model_falls_back_to_the_next_uncapped_model(self):
+        catalog = {
+            "inheritedProviderInstanceId": "grok",
+            "inheritedModel": "grok-4.7",
+            "providers": [{
+                "providerInstanceId": "cursor", "canRunChildTask": True, "constraints": [],
+                "models": [
+                    {"id": "claude-haiku-5-5", "options": []},
+                    {"id": "claude-haiku-4-5", "options": []},
+                ],
+            }],
+        }
+        entry = roles.resolve(
+            config(**{"bug-fix": [{"providerInstanceId": "cursor", "model": "claude-gone"}]}),
+            catalog,
+            ["bug-fix"],
+        )["roles"]["bug-fix"]
+        self.assertEqual(entry["seats"], [{"providerInstanceId": "cursor", "model": "claude-haiku-4-5"}])
+        self.assertEqual(entry["notes"], ["cursor/claude-gone is not in the catalog; using claude-haiku-4-5"])
+
+    def test_missing_model_on_a_provider_with_only_capped_models_raises(self):
+        catalog = {
+            "providers": [{
+                "providerInstanceId": "cursor", "canRunChildTask": True, "constraints": [],
+                "models": [{"id": "claude-haiku-5-5", "options": []}],
+            }],
+        }
+        with self.assertRaises(roles.RolesError) as caught:
+            roles.resolve(
+                config(**{"bug-fix": [{"providerInstanceId": "cursor", "model": "claude-gone"}]}),
+                catalog,
+                ["bug-fix"],
+            )
+        self.assertEqual(
+            str(caught.exception),
+            "role 'bug-fix' cannot use cursor/claude-haiku-5-5: "
+            "claude-haiku-5-5 is capped at 100000 prompt tokens, and only skill tests may run a capped model",
+        )
+
+    def test_preferred_seat_skips_a_capped_parent(self):
+        catalog = {
+            "inheritedProviderInstanceId": "cursor",
+            "inheritedModel": "claude-haiku-5-5",
+            "providers": [{
+                "providerInstanceId": "cursor", "canRunChildTask": True, "constraints": [],
+                "models": [
+                    {"id": "claude-haiku-5-5", "options": []},
+                    {"id": "claude-sonnet-5", "options": [
+                        {"id": "effort", "type": "select", "options": [{"id": "xhigh"}]},
+                    ]},
+                ],
+            }],
+        }
+        entry = roles.resolve(config(), catalog, ["bug-fix"])["roles"]["bug-fix"]
+        self.assertEqual(entry["seats"], [{
+            "providerInstanceId": "cursor",
+            "model": "claude-sonnet-5",
+            "options": {"effort": "xhigh"},
+        }])
+        self.assertEqual(entry["notes"], [
+            "bug-fix seat 1: wanted grok-4.7, using cursor/claude-sonnet-5 (missing family)",
+        ])
+
+    def test_verifiers_skip_a_capped_parent_and_a_capped_first_model(self):
+        capped = {"id": "claude-haiku-5-5", "options": []}
+        catalog = {
+            "inheritedProviderInstanceId": "cursor",
+            "inheritedModel": "claude-haiku-5-5",
+            "providers": [
+                {"providerInstanceId": "cursor", "canRunChildTask": True, "constraints": [],
+                 "models": [capped, {"id": "gpt-5.4-mini", "options": []}]},
+                {"providerInstanceId": "claudeAgent", "canRunChildTask": True, "constraints": [],
+                 "models": [capped, {"id": "claude-opus-5-5", "options": []}]},
+                {"providerInstanceId": "acme", "canRunChildTask": True, "constraints": [], "models": [capped]},
+            ],
+        }
+        seats = roles.resolve(config(), catalog, ["verifiers"])["roles"]["verifiers"]["seats"]
+        self.assertEqual(seats, [
+            {"providerInstanceId": "cursor", "model": "gpt-5.4-mini"},
+            {"providerInstanceId": "claudeAgent", "model": "claude-opus-5-5"},
+        ])
+
+    def test_resolve_refuses_a_capped_seat_with_no_catalog(self):
+        with self.assertRaises(roles.RolesError) as caught:
+            roles.resolve(
+                config(**{"bug-fix": [{"providerInstanceId": "claudeAgent", "model": "claude-haiku-5-5"}]}),
+                None,
+                ["bug-fix"],
+            )
+        self.assertEqual(
+            str(caught.exception),
+            "role 'bug-fix' cannot use claudeAgent/claude-haiku-5-5: "
+            "claude-haiku-5-5 is capped at 100000 prompt tokens, and only skill tests may run a capped model",
+        )
 
 
 class InstallTest(unittest.TestCase):
@@ -307,6 +990,296 @@ class InstallTest(unittest.TestCase):
             self.assertTrue((shared / "swarm/SKILL.md").exists())
 
 
+CODE_DELEGATE_SITES = (
+    ("poteto-mode/playbooks/feature.md", "4. Delegate code-writing", "Playbook: playbooks/feature.md"),
+    ("poteto-mode/playbooks/refactoring.md", "5. Move in small", "Playbook: playbooks/refactoring.md"),
+    ("poteto-mode/playbooks/bug-fix.md", "3. Plan the fix.", "Playbook: playbooks/bug-fix.md"),
+    ("poteto-mode/playbooks/perf-issue.md", "3. Plan the fix from the trace.", "Playbook: playbooks/perf-issue.md"),
+    ("poteto-mode/playbooks/hillclimb.md", "   - Hand the change", "Playbook: playbooks/hillclimb.md"),
+    ("swarm/SKILL.md", "Every brief stands alone.", "Playbook: playbooks/<name>.md"),
+    ("arena/SKILL.md", "Spawn all N candidates", "Playbook: playbooks/<name>.md"),
+)
+
+
+class CodeDelegateBriefTest(unittest.TestCase):
+    def test_every_code_delegate_step_points_at_the_brief_check(self):
+        for path, step, playbook_line in CODE_DELEGATE_SITES:
+            lines = (ROOT / "skills" / path).read_text().splitlines()
+            matches = [line for line in lines if line.startswith(step)]
+            self.assertEqual(len(matches), 1, (path, step))
+            for needed in ("pstack-runtime/SKILL.md#delegation)", "poteto-agent persona first", playbook_line, "`roles.py mode --playbook ", "`roles.py check-brief` before `delegate_task`"):
+                self.assertIn(needed, matches[0], path)
+
+    def test_routed_skill_exception_excludes_code_writing_children(self):
+        text = (ROOT / "skills/poteto-mode/SKILL.md").read_text()
+        self.assertIn("It never covers a code-writing child.", text)
+
+
+MODE_POINTER_SITES = {
+    **{f"{name}/SKILL.md": "skill" for name in (
+        "poteto-mode", "how", "why", "architect", "arena", "no-comments", "swarm", "interrogate",
+        "show-me-your-work", "recall", "automate-me", "maintain-verification-skill", "reflect",
+        "pstack-author-skill", "landing",
+    )},
+    **{f"poteto-mode/playbooks/{stem}.md": "playbook" for stem in (
+        "feature", "bug-fix", "refactoring", "perf-issue", "hillclimb", "opening-a-pr",
+        "autopilot-full", "autopilot-stack", "multi-phase-plan", "orchestrate", "shipping",
+        "visual-parity", "worktree-cleanup",
+    )},
+}
+MODES_UNCHANGED = {
+    "pstack-runtime/SKILL.md": "the Modes section's home",
+    "brigade/SKILL.md": "brigade's mode lands in its own change",
+    "setup-pstack/SKILL.md": "the smoke test is kept, one per provider",
+    "poteto-help/SKILL.md": "names delegate_task to explain the persona and spawns nothing",
+    "poteto-mode/playbooks/autonomous-run.md": "the watcher is kept",
+    "poteto-mode/playbooks/eval.md": "keeps arena and its judge, because comparing candidates is its purpose",
+}
+SPAWNS = re.compile(r"delegate_task|t3_thread_launch|create_threads")
+RUNTIME_LINK = re.compile(r"pstack-runtime/SKILL\.md#([^)\s]+)\)")
+
+
+def pointer_sentence(kind):
+    rel = "../pstack-runtime/SKILL.md" if kind == "skill" else "../../pstack-runtime/SKILL.md"
+    return (
+        f"[The runtime's Modes section]({rel}#modes) sets the mode lines of every brief "
+        f"this {kind} writes and how its spawns run in light mode."
+    )
+
+
+def unfenced_lines(text):
+    fenced = False
+    for line in text.splitlines():
+        if line.lstrip().startswith("```"):
+            fenced = not fenced
+            continue
+        if not fenced:
+            yield line
+
+
+def heading_slug(heading):
+    kept = "".join(char for char in heading.lower() if char.isalnum() or char in " -")
+    return kept.replace(" ", "-")
+
+
+GATE_CONTRACT = """\
+Gate review contract. These rules override the persona above and the tasks below where they differ.
+Do not edit files, commit, or push. Do not post on the PR. Return your report to the parent.
+Launch no child task, thread, or subagent. Do not run the how, why, architect, or interrogate skill. Do not launch show-me-your-work's trail reviewer.
+Read the whole diff and the nearby code yourself. You may run git log -L and git blame. Run the named verification commands yourself.
+When a claim or finding needs investigation beyond those reads, return send-back. Name the file, the line, the claim, and the question the fix must answer.
+Report each comment the persona would delete as a send-back finding with its path and line. Make no edit.
+End with pass, send-back, or blocked, the full head SHA, the author, and the verifier.
+"""
+
+SEAT_RULE = """\
+Seat rule. Copy the Mode value above into --brief-mode on every roles.py mode and roles.py show call you make, and pass no other mode flag. Never pass --session-mode. Mode source names where your launcher's decision came from. It does not make this thread a session.
+"""
+
+
+def gate_contract(runtime):
+    start = runtime.index("2. **Brief.**")
+    window = runtime[start:].split("\n3. **Verdict.**", 1)[0]
+    lines = window.splitlines()
+    open_at = next(i for i, line in enumerate(lines) if line.strip() == "```text")
+    close_at = next(i for i, line in enumerate(lines) if i > open_at and line.strip() == "```")
+    body = "\n".join(lines[open_at + 1:close_at]) + "\n"
+    return textwrap.dedent(body)
+
+
+def seat_rule(runtime):
+    start = runtime.index("is not a code delegate")
+    window = runtime[start:].split("\n- A read-only leaf", 1)[0]
+    lines = window.splitlines()
+    open_at = next(i for i, line in enumerate(lines) if line.strip() == "```text")
+    close_at = next(i for i, line in enumerate(lines) if i > open_at and line.strip() == "```")
+    body = "\n".join(lines[open_at + 1:close_at]) + "\n"
+    return textwrap.dedent(body)
+
+
+def brief_paragraph(runtime):
+    start = runtime.index("2. **Brief.**")
+    window = runtime[start:].split("\n3. **Verdict.**", 1)[0]
+    prose = []
+    for line in window.splitlines():
+        if line.strip().startswith("```"):
+            break
+        if prose and not line.strip():
+            break
+        if line.strip():
+            prose.append(line.strip())
+    return " ".join(prose)
+
+
+def light_behavior_rows(runtime):
+    section = runtime.split("### Light behavior", 1)[1].split("\n### ", 1)[0]
+    rows = []
+    for line in section.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("|"):
+            if rows:
+                break
+            continue
+        if not stripped.replace("|", "").replace(":", "").replace("-", "").strip():
+            continue
+        if stripped.strip("|").split("|", 1)[0].strip() == "Spawn":
+            continue
+        rows.append(stripped)
+    return rows
+
+
+def light_row(runtime, spawn):
+    matches = [row for row in light_behavior_rows(runtime) if row.split("|", 2)[1].strip() == spawn]
+    if len(matches) != 1:
+        raise AssertionError(f"{spawn}: expected 1 light row, found {len(matches)}")
+    return matches[0]
+
+
+class ModesTest(unittest.TestCase):
+    def setUp(self):
+        self.runtime = (ROOT / "skills/pstack-runtime/SKILL.md").read_text()
+
+    def test_every_pointer_site_holds_the_pointer_once_outside_a_fence(self):
+        for path, kind in MODE_POINTER_SITES.items():
+            text = (ROOT / "skills" / path).read_text()
+            sentence = pointer_sentence(kind)
+            with self.subTest(path=path):
+                self.assertEqual(text.count(sentence), 1)
+                self.assertIn(sentence, list(unfenced_lines(text)))
+
+    def test_every_spawning_file_points_at_modes_or_says_why_not(self):
+        skills = ROOT / "skills"
+        spawning = sorted(
+            str(path.relative_to(skills))
+            for path in [*skills.glob("*/SKILL.md"), *skills.glob("poteto-mode/playbooks/*.md")]
+            if SPAWNS.search(path.read_text())
+        )
+        self.assertEqual([path for path in spawning if path not in MODE_POINTER_SITES and path not in MODES_UNCHANGED], [])
+        self.assertEqual([path for path in MODES_UNCHANGED if not (skills / path).is_file()], [])
+        self.assertEqual(set(MODE_POINTER_SITES) & set(MODES_UNCHANGED), set())
+
+    def test_every_runtime_link_names_a_runtime_heading(self):
+        slugs = {heading_slug(line.lstrip("#").strip()) for line in unfenced_lines(self.runtime) if line.startswith("#")}
+        broken = []
+        for path in sorted((ROOT / "skills").rglob("*.md")):
+            for fragment in RUNTIME_LINK.findall(path.read_text()):
+                if fragment not in slugs:
+                    broken.append(f"{path.relative_to(ROOT)}#{fragment}")
+        for fragment in re.findall(r"\]\(#([^)\s]+)\)", self.runtime):
+            if fragment not in slugs:
+                broken.append(f"pstack-runtime/SKILL.md#{fragment}")
+        self.assertEqual(broken, [])
+        self.assertEqual(heading_slug("Resolve and carry the mode"), "resolve-and-carry-the-mode")
+
+    def test_runtime_has_one_modes_section_between_roles_and_isolation(self):
+        headings = [line for line in unfenced_lines(self.runtime) if line.startswith("## ") or line.startswith("### ")]
+        self.assertEqual(headings.count("## Modes"), 1)
+        modes = headings.index("## Modes")
+        self.assertLess(headings.index("## Roles"), modes)
+        isolation = headings.index("## Isolation")
+        self.assertEqual(headings[modes + 1:isolation], [
+            "### Resolve and carry the mode",
+            "### Light behavior",
+            "### Never cut",
+            "### Gate review",
+            "### Announcement",
+        ])
+        self.assertIn("pass check <item> --sha <head> --json", self.runtime)
+
+    def test_deadlines_and_delegation_step_4_carry_the_mode_lines(self):
+        deadlines = self.runtime.split("## Deadlines", 1)[1].split("\n## ", 1)[0]
+        self.assertIn(
+            "A step that the brief's `Waived by mode:` line names is not a skip, "
+            "because the mode removed it before the attempt started.",
+            deadlines,
+        )
+        step = next(line for line in self.runtime.splitlines() if line.startswith("4. A child starts with only its brief."))
+        for needed in ("roles.py mode --cwd", "Write no `Playbook:` line of your own", "--brief-mode"):
+            self.assertIn(needed, step)
+
+    def test_opening_a_pr_gates_light_prs_before_the_forge(self):
+        text = (ROOT / "skills/poteto-mode/playbooks/opening-a-pr.md").read_text()
+        blocks = text.split("\n\n")
+        lead = [block.split(" ", 1)[0] for block in blocks]
+        self.assertLess(lead.index("**Descriptions.**"), lead.index("**Gate.**"))
+        self.assertLess(lead.index("**Gate.**"), lead.index("**Forge.**"))
+        self.assertIn("(../../pstack-runtime/SKILL.md#gate-review)", blocks[lead.index("**Gate.**")])
+        child = next(block for block in blocks if block.startswith("A child task that opens a PR"))
+        self.assertIn("that child runs the **Gate** paragraph above in place of `interrogate` and `/no-comments`.", child)
+        self.assertIn("Run `/no-comments` before review.", text)
+
+    def test_gate_contract_is_literal(self):
+        self.assertEqual(gate_contract(self.runtime), GATE_CONTRACT)
+
+    def test_seat_rule_is_literal(self):
+        self.assertEqual(seat_rule(self.runtime), SEAT_RULE)
+
+    def test_every_owner_row_carries_the_seat_rule(self):
+        rows = [row for row in light_behavior_rows(self.runtime) if "mode lines" in row]
+        self.assertGreaterEqual(len(rows), 4)
+        for row in rows:
+            self.assertIn(
+                "the seat rule from [Resolve and carry the mode](#resolve-and-carry-the-mode)",
+                row,
+            )
+
+    def test_child_facing_light_rows(self):
+        self.assertIn(
+            "Its brief lists every `threadId` that `t3_thread_list` returns in the window, across every page. The parent filters and samples none",
+            light_row(self.runtime, "`automate-me`"),
+        )
+        self.assertIn("pass `--session-mode full`", light_row(self.runtime, "`reflect`"))
+        verification = light_row(self.runtime, "Multi-phase verification")
+        self.assertIn("every **Verify, live** lane box that drives its surface", verification)
+        self.assertIn("Launch no perf lane.", verification)
+        self.assertIn("(#gate-review)", verification)
+
+    def test_explicit_reflect_names_session_full_at_both_flag_sites(self):
+        roles = self.runtime.split("### Where roles live", 1)[1].split("\n### ", 1)[0]
+        paragraph = next(block for block in roles.split("\n\n") if block.startswith("When the brief this call seats"))
+        self.assertIn(
+            "except for a user's explicit reflect, which passes `--session-mode full`",
+            paragraph,
+        )
+        resolve = self.runtime.split("### Resolve and carry the mode", 1)[1].split("\n### ", 1)[0]
+        self.assertIn("except the explicit reflect below", resolve)
+        self.assertIn(
+            "A user's explicit reflect passes `--session-mode full` on every `roles.py show` call",
+            resolve,
+        )
+
+    def test_automate_me_brief_lists_every_assigned_thread(self):
+        text = (ROOT / "skills/automate-me/SKILL.md").read_text()
+        self.assertIn("brief lists every `threadId` in its assignment", text)
+        self.assertIn("An assignment is never a sample or a pick of the relevant threads.", text)
+        self.assertNotIn("gets its slice", text)
+
+    def test_autopilot_owner_message_carries_the_seat_rule(self):
+        text = (ROOT / "skills/poteto-mode/playbooks/autopilot-full.md").read_text()
+        self.assertIn(
+            "Each owner `message`, including a replacement's, carries the mode lines and the seat rule "
+            "from [Resolve and carry the mode](../../pstack-runtime/SKILL.md#resolve-and-carry-the-mode).",
+            text,
+        )
+
+    def test_gate_brief_pastes_persona_then_contract(self):
+        paragraph = brief_paragraph(self.runtime)
+        self.assertIn("Paste the body of `agents/comment-sicko.md` unchanged", paragraph)
+        self.assertIn("paste the gate contract below unchanged", paragraph)
+        self.assertNotIn("and ask for that skill's checks", self.runtime)
+
+    def test_every_gate_review_row_links_gate_review(self):
+        for row in light_behavior_rows(self.runtime):
+            if "gate review" not in row and "is the gate" not in row:
+                continue
+            spawn = row.split("|")[1].strip()
+            self.assertIn("(#gate-review)", row, spawn)
+
+    def test_full_mode_persona_keeps_investigation(self):
+        persona = (ROOT / "skills/pstack-runtime/agents/comment-sicko.md").read_text()
+        self.assertIn("I run the **how** skill, the **why** skill, or both", persona)
+
+
 class BuildTest(unittest.TestCase):
     def test_generated_tree_passes_check(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -352,6 +1325,957 @@ class BuildTest(unittest.TestCase):
             (skill / "SKILL.md").write_text("---\nname: demo\ndescription: d\n---\n\nSpawn with `subagent_type: generalPurpose`.\n")
             findings = check.check_tree(directory)
         self.assertTrue(any("subagent_type" in finding for finding in findings))
+
+    def test_check_requires_watch_tool_names_on_the_runtime_skill(self):
+        with tempfile.TemporaryDirectory() as directory:
+            skill = Path(directory) / "pstack-runtime"
+            skill.mkdir()
+            (skill / "SKILL.md").write_text("---\nname: pstack-runtime\ndescription: d\n---\n\nNo watch here.\n")
+            findings = check.check_tree(directory)
+            self.assertIn("pstack-runtime/SKILL.md: missing watch_pull_request", findings)
+            self.assertIn("pstack-runtime/SKILL.md: missing unwatch_pull_request", findings)
+            (skill / "SKILL.md").write_text(
+                "---\nname: pstack-runtime\ndescription: d\n---\n\n"
+                "Call `watch_pull_request`. Call `unwatch_pull_request`.\n"
+            )
+            findings = check.check_tree(directory)
+        self.assertFalse(any("missing watch" in finding or "missing unwatch" in finding for finding in findings))
+
+    def test_check_requires_the_watch_tool_and_version_on_setup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            skill = Path(directory) / "setup-pstack"
+            skill.mkdir()
+            (skill / "SKILL.md").write_text("---\nname: setup-pstack\ndescription: d\n---\n\nNo watch here.\n")
+            findings = check.check_tree(directory)
+            self.assertIn("setup-pstack/SKILL.md: missing watch_pull_request", findings)
+            self.assertIn("setup-pstack/SKILL.md: missing 0.0.46-nightly.20261005.2702", findings)
+            (skill / "SKILL.md").write_text(
+                "---\nname: setup-pstack\ndescription: d\n---\n\n"
+                "Call `watch_pull_request`. T3 Code 0.0.46-nightly.20261005.2702 or later.\n"
+            )
+            findings = check.check_tree(directory)
+        self.assertFalse(any("missing watch_pull_request" in finding or "missing 0.0.46" in finding for finding in findings))
+
+    def test_check_rejects_the_cursor_xhigh_slug(self):
+        with tempfile.TemporaryDirectory() as directory:
+            skill = Path(directory) / "demo"
+            skill.mkdir()
+            (skill / "SKILL.md").write_text("---\nname: demo\ndescription: d\n---\n\nUse claude-opus-5-5-xhigh.\n")
+            findings = check.check_tree(directory)
+        self.assertTrue(any("claude-opus-5-5-xhigh" in finding for finding in findings))
+
+    def test_check_rejects_an_indented_catalog_heredoc_closer(self):
+        bad = "\n".join([
+            "---",
+            "name: demo",
+            "description: d",
+            "---",
+            "",
+            "```bash",
+            "python3 tool <<'JSON'",
+            '{"ok": true}',
+            "  JSON",
+            "```",
+            "",
+        ])
+        good = "\n".join([
+            "---",
+            "name: demo",
+            "description: d",
+            "---",
+            "",
+            "```bash",
+            "python3 tool <<'JSON'",
+            '{"ok": true}',
+            "JSON",
+            "```",
+            "",
+        ])
+        plain = "\n".join([
+            "---",
+            "name: demo",
+            "description: d",
+            "---",
+            "",
+            "  JSON",
+            "",
+        ])
+        with tempfile.TemporaryDirectory() as directory:
+            skill = Path(directory) / "demo"
+            skill.mkdir()
+            (skill / "SKILL.md").write_text(bad)
+            findings = check.check_tree(directory)
+        self.assertIn(
+            "demo/SKILL.md:9: catalog heredoc closer JSON is indented. Put JSON at column 0",
+            findings,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            skill = Path(directory) / "demo"
+            skill.mkdir()
+            (skill / "SKILL.md").write_text(good)
+            findings = check.check_tree(directory)
+        self.assertFalse(any("heredoc closer" in finding for finding in findings))
+        with tempfile.TemporaryDirectory() as directory:
+            skill = Path(directory) / "demo"
+            skill.mkdir()
+            (skill / "SKILL.md").write_text(plain)
+            findings = check.check_tree(directory)
+        self.assertFalse(any("heredoc closer" in finding for finding in findings))
+
+    def test_check_scopes_the_catalog_heredoc_closer_to_its_body(self):
+        text = "\n".join([
+            "---",
+            "name: demo",
+            "description: d",
+            "---",
+            "",
+            "  JSON",
+            "```bash",
+            "python3 tool <<'JSON'",
+            '{"name": "JSON"}',
+            "JSON ",
+            "JSON\t",
+            "  JSON",
+            "JSON",
+            "```",
+            "",
+            "  JSON",
+            "",
+        ])
+        with tempfile.TemporaryDirectory() as directory:
+            skill = Path(directory) / "demo"
+            skill.mkdir()
+            (skill / "SKILL.md").write_text(text)
+            findings = check.check_tree(directory)
+        self.assertEqual(findings, [
+            "demo/SKILL.md:10: catalog heredoc closer JSON has trailing whitespace. The closer is JSON with nothing after it",
+            "demo/SKILL.md:11: catalog heredoc closer JSON has trailing whitespace. The closer is JSON with nothing after it",
+            "demo/SKILL.md:12: catalog heredoc closer JSON is indented. Put JSON at column 0",
+        ])
+
+    def light_findings(self, rel, body):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / rel
+            path.parent.mkdir(parents=True)
+            name = rel.split("/", 1)[0]
+            path.write_text(f"---\nname: {name}\ndescription: d\n---\n\n{body}\n" if rel.endswith("SKILL.md") else body)
+            return [finding for finding in check.check_tree(directory) if "light" in finding]
+
+    def test_check_rejects_a_pasted_waiver_table(self):
+        header = "| Playbook | `first` | `fix` and `bounce` |"
+        findings = self.light_findings("demo/SKILL.md", "\n".join([
+            header,
+            "| --- | --- | --- |",
+            "| Feature | Arena, Interrogate, Comment Sicko | How, Architect, Arena, Interrogate, Comment Sicko |",
+        ]))
+        self.assertIn(
+            f"demo/SKILL.md:6: light table restated. Link pstack-runtime/SKILL.md#modes instead of pasting it: {header}",
+            findings,
+        )
+
+    def test_check_rejects_a_census_with_a_light_column(self):
+        header = "| Census row | Full | Light | Kind |"
+        findings = self.light_findings("demo/SKILL.md", f"{header}\n| --- | --- | --- | --- |")
+        self.assertEqual(findings, [
+            f"demo/SKILL.md:6: light table restated. Link pstack-runtime/SKILL.md#modes instead of pasting it: {header}",
+        ])
+
+    def test_check_rejects_light_mode_prose_without_the_runtime_link(self):
+        findings = self.light_findings("demo/SKILL.md", "In light mode, launch at most 3 workers.")
+        self.assertEqual(findings, [
+            "demo/SKILL.md:6: names light mode without a link to the runtime's Modes section. "
+            "Link pstack-runtime/SKILL.md#modes: In light mode, launch at most 3 workers.",
+        ])
+
+    def test_check_accepts_the_modes_pointer(self):
+        pointer = (
+            "[The runtime's Modes section](../pstack-runtime/SKILL.md#modes) sets the mode lines "
+            "of every brief this skill writes and how its spawns run in light mode."
+        )
+        self.assertEqual(self.light_findings("demo/SKILL.md", pointer), [])
+
+    def test_check_lets_the_runtime_hold_the_light_table(self):
+        body = "\n".join([
+            "Call `watch_pull_request`. Call `unwatch_pull_request`.",
+            "",
+            "| Spawn | Light behavior |",
+            "| --- | --- |",
+            "| Feature | Arena, Interrogate, Comment Sicko |",
+            "",
+            "In light mode, launch at most 3 workers.",
+        ])
+        with tempfile.TemporaryDirectory() as directory:
+            skill = Path(directory) / "pstack-runtime"
+            skill.mkdir()
+            (skill / "SKILL.md").write_text(f"---\nname: pstack-runtime\ndescription: d\n---\n\n{body}\n")
+            self.assertEqual(check.check_tree(directory), [])
+
+    def test_check_ignores_waiver_names_outside_markdown(self):
+        findings = self.light_findings("demo/scripts/x.py", 'ROW = ("Arena", "Interrogate", "Comment Sicko")\n')
+        self.assertEqual(findings, [])
+
+    def test_check_accepts_an_unrelated_playbook_table(self):
+        with tempfile.TemporaryDirectory() as directory:
+            skill = Path(directory) / "demo"
+            skill.mkdir()
+            (skill / "SKILL.md").write_text(
+                "---\nname: demo\ndescription: d\n---\n\n| Playbook | Purpose |\n| --- | --- |\n| Feature | New behavior |\n"
+            )
+            self.assertEqual(check.check_tree(directory), [])
+
+
+def fragment_name(branch):
+    return branch.replace("%", "%25").replace("/", "%2F") + ".md"
+
+
+def fragment_holds_bullets(lines):
+    open_bullet = False
+    for line in lines:
+        if line.startswith("- ") and line[2:].strip():
+            open_bullet = True
+            continue
+        if open_bullet and (line.startswith(" ") or line.startswith("\t")) and line.strip():
+            continue
+        return False
+    return open_bullet
+
+
+def changelog_findings(root):
+    findings = []
+    changelog = root / "CHANGELOG.md"
+    if changelog.is_file():
+        for line in changelog.read_text().splitlines():
+            if line.strip() == "## Unreleased":
+                findings.append(
+                    "CHANGELOG.md has a ## Unreleased heading. Write the bullet under changes/."
+                )
+                break
+    changes = root / "changes"
+    if not changes.is_dir():
+        return findings
+    for path in sorted(p for p in changes.rglob("*") if p.is_file()):
+        relative = path.relative_to(changes).as_posix()
+        if "/" in relative:
+            findings.append(f"changes/{relative} sits in a subdirectory. changes/ is flat.")
+            continue
+        if not fragment_holds_bullets(path.read_text().splitlines()):
+            findings.append(f"changes/{relative} holds a line that is not a bullet.")
+    return findings
+
+
+def _git(repo, *args):
+    return subprocess.run(
+        ["git", *args],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "GIT_AUTHOR_NAME": "t",
+            "GIT_AUTHOR_EMAIL": "t@t",
+            "GIT_COMMITTER_NAME": "t",
+            "GIT_COMMITTER_EMAIL": "t@t",
+            "LC_ALL": "C",
+        },
+    ).stdout
+
+
+def release_bullets(repo):
+    log = _git(
+        repo,
+        "log",
+        "--reverse",
+        "--diff-filter=A",
+        "--format=",
+        "--name-only",
+        "--",
+        "changes/",
+    )
+    order = []
+    for line in log.splitlines():
+        if not line.startswith("changes/") or line.count("/") != 1 or not (repo / line).is_file():
+            continue
+        if line in order:
+            order.remove(line)
+        order.append(line)
+    bullets = []
+    for relative in order:
+        bullets.extend((repo / relative).read_text().splitlines())
+    return bullets
+
+
+class ChangelogTest(unittest.TestCase):
+    def test_fragment_name_encodes_percent_before_slash(self):
+        self.assertEqual(fragment_name("docs/a"), "docs%2Fa.md")
+        self.assertEqual(fragment_name("docs-a"), "docs-a.md")
+        self.assertEqual(fragment_name("a/b%c"), "a%2Fb%25c.md")
+
+    def test_changelog_findings_name_changes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "CHANGELOG.md").write_text("# Changelog\n\n## Unreleased\n\n- old\n")
+            (root / "changes").mkdir()
+            (root / "changes" / "note.md").write_text("Prose.\n")
+            nested = root / "changes" / "nested"
+            nested.mkdir()
+            (nested / "x.md").write_text("- hidden\n")
+            self.assertEqual(changelog_findings(root), [
+                "CHANGELOG.md has a ## Unreleased heading. Write the bullet under changes/.",
+                "changes/nested/x.md sits in a subdirectory. changes/ is flat.",
+                "changes/note.md holds a line that is not a bullet.",
+            ])
+            (root / "CHANGELOG.md").write_text("# Changelog\n")
+            (root / "changes" / "nested" / "x.md").unlink()
+            nested.rmdir()
+            (root / "changes" / "note.md").write_text("- First.\n- Second.\n")
+            self.assertEqual(changelog_findings(root), [])
+            (root / "changes" / "note.md").write_text(
+                "- A user-facing change spans\n  two lines in the same bullet.\n"
+            )
+            self.assertEqual(changelog_findings(root), [])
+            (root / "changes" / "note.md").write_text(
+                "- A user-facing change spans\nthen prose on its own line.\n"
+            )
+            self.assertEqual(changelog_findings(root), [
+                "changes/note.md holds a line that is not a bullet.",
+            ])
+            (root / "changes" / "note.md").unlink()
+            self.assertEqual(changelog_findings(root), [])
+            shutil.rmtree(root / "changes")
+            self.assertEqual(changelog_findings(root), [])
+
+    def test_repo_changelog_has_no_unreleased_heading(self):
+        findings = changelog_findings(ROOT)
+        self.assertEqual(findings, [], "\n".join(findings) or "Write bullets under changes/.")
+        contributing = (ROOT / "CONTRIBUTING.md").read_text()
+        self.assertIn(
+            "git log --reverse --diff-filter=A --format= --name-only -- changes/",
+            contributing,
+        )
+        self.assertNotIn("Add a line under Unreleased", contributing)
+        self.assertNotIn("Each bullet is one line", contributing)
+        self.assertIn("Indent a continuation line under that bullet.", contributing)
+        self.assertIn("docs/guide.md", contributing)
+        self.assertIn("one docs change", contributing)
+
+    def test_release_cut_matches_the_fragments_that_still_exist(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            _git(repo, "init", "-q", "-b", "main")
+            (repo / "changes").mkdir()
+            (repo / "changes" / "first.md").write_text("- alpha\n")
+            _git(repo, "add", "changes")
+            _git(repo, "commit", "-qm", "first")
+            (repo / "changes" / "second.md").write_text("- beta\n")
+            _git(repo, "add", "changes")
+            _git(repo, "commit", "-qm", "second")
+            _git(repo, "rm", "-q", "changes/first.md")
+            _git(repo, "commit", "-qm", "cut")
+            (repo / "changes" / "first.md").write_text(
+                "- alpha again\n  kept on the next line.\n"
+            )
+            _git(repo, "add", "changes")
+            _git(repo, "commit", "-qm", "first again")
+            bullets = release_bullets(repo)
+            self.assertEqual(bullets, [
+                "- beta",
+                "- alpha again",
+                "  kept on the next line.",
+            ])
+            section = "## 0.3.0 (2026-10-06)\n\n" + "\n".join(bullets) + "\n"
+            held = "".join(
+                (repo / name).read_text()
+                for name in ("changes/second.md", "changes/first.md")
+            )
+            self.assertEqual(section, "## 0.3.0 (2026-10-06)\n\n" + held)
+            self.assertNotIn("- alpha\n", section)
+            self.assertIn("  kept on the next line.\n", section)
+            (repo / "CHANGELOG.md").write_text("# Changelog\n\n" + section)
+            _git(repo, "add", "CHANGELOG.md")
+            _git(repo, "rm", "-q", "changes/first.md", "changes/second.md")
+            _git(repo, "commit", "-qm", "0.3.0")
+            self.assertEqual(
+                _git(repo, "show", "HEAD^:changes/first.md"),
+                "- alpha again\n  kept on the next line.\n",
+            )
+            self.assertEqual(
+                _git(repo, "show", "HEAD:CHANGELOG.md"),
+                "# Changelog\n\n## 0.3.0 (2026-10-06)\n\n"
+                "- beta\n- alpha again\n  kept on the next line.\n",
+            )
+            names = [
+                line for line in _git(
+                    repo, "diff-tree", "--no-commit-id", "--name-status",
+                    "--no-renames", "-r", "HEAD",
+                ).splitlines()
+                if line
+            ]
+            self.assertEqual(names, [
+                "A\tCHANGELOG.md",
+                "D\tchanges/first.md",
+                "D\tchanges/second.md",
+            ])
+            self.assertEqual(release_bullets(repo), [])
+
+
+AUDIT = ROOT / "t3/overrides/poteto-mode/scripts/worktree-audit.sh"
+PREVIEW_TOOLS = (
+    "preview_hover",
+    "preview_drag",
+    "preview_select",
+    "preview_upload",
+    "preview_dialog",
+)
+
+
+def _init_repo(path):
+    subprocess.run(["git", "init", "-q", "-b", "main", str(path)], check=True)
+    subprocess.run(["git", "-C", str(path), "config", "user.email", "audit@example.com"], check=True)
+    subprocess.run(["git", "-C", str(path), "config", "user.name", "audit"], check=True)
+    (path / "f").write_text("a\n")
+    subprocess.run(["git", "-C", str(path), "add", "f"], check=True)
+    subprocess.run(["git", "-C", str(path), "commit", "-qm", "init"], check=True)
+
+
+def _add_worktree(repo, path, branch):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "worktree", "add", "-q", str(path), "-b", branch],
+        check=True,
+    )
+
+
+class WorktreeAuditTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.repo = self.root / "repo"
+        self.repo.mkdir()
+        _init_repo(self.repo)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _audit(self, *args, **env):
+        run_env = os.environ.copy()
+        for key in ("T3CODE_HOME", "T3_HOME", "T3_WORKTREES"):
+            run_env.pop(key, None)
+        run_env.update(env)
+        completed = subprocess.run(
+            [str(AUDIT), str(self.repo), *args],
+            capture_output=True,
+            text=True,
+            env=run_env,
+            timeout=60,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        marks = {}
+        lines = [line for line in completed.stdout.splitlines() if line]
+        self.assertGreaterEqual(len(lines), 2, completed.stdout)
+        for line in lines[1:]:
+            cols = line.split("\t")
+            self.assertEqual(len(cols), 10, line)
+            marks[cols[9]] = cols[7]
+        return marks
+
+    def test_configured_locations_count_and_bad_ones_do_not(self):
+        t3_home = self.root / "code-home"
+        other_home = self.root / "other-home"
+        default = t3_home / "worktrees" / "proj" / "wt-default"
+        custom = self.root / "home" / "custom" / "wt-custom"
+        previous = self.root / "old" / "wt-old"
+        stray = self.root / "stray" / "wt-stray"
+        _add_worktree(self.repo, default, "b-default")
+        _add_worktree(self.repo, custom, "b-custom")
+        _add_worktree(self.repo, previous, "b-old")
+        _add_worktree(self.repo, stray, "b-stray")
+        (t3_home / "userdata").mkdir(parents=True)
+        (t3_home / "userdata" / "settings.json").write_text(json.dumps({
+            "worktreesDirectory": "~/custom",
+            "previousWorktreesDirectories": [str(previous.parent), "/", "relative/nope"],
+        }))
+        marks = self._audit(
+            T3CODE_HOME=str(t3_home),
+            T3_HOME=str(other_home),
+            HOME=str(self.root / "home"),
+        )
+        self.assertEqual(marks[str(default)], "yes")
+        self.assertEqual(marks[str(custom)], "yes")
+        self.assertEqual(marks[str(previous)], "yes")
+        self.assertEqual(marks[str(stray)], "no")
+
+    def test_flag_and_env_replace_the_configured_directory(self):
+        t3_home = self.root / "t3home"
+        default = t3_home / "worktrees" / "proj" / "wt-default"
+        chosen = self.root / "chosen" / "wt"
+        decoy = self.root / "decoy" / "wt"
+        _add_worktree(self.repo, default, "b-default")
+        _add_worktree(self.repo, chosen, "b-chosen")
+        _add_worktree(self.repo, decoy, "b-decoy")
+        (t3_home / "userdata").mkdir(parents=True)
+        (t3_home / "userdata" / "settings.json").write_text(json.dumps({
+            "worktreesDirectory": str(decoy.parent),
+        }))
+        marks = self._audit(
+            "--t3-worktrees", str(chosen.parent),
+            T3_HOME=str(t3_home),
+            T3_WORKTREES=str(decoy.parent),
+        )
+        self.assertEqual(marks[str(default)], "yes")
+        self.assertEqual(marks[str(chosen)], "yes")
+        self.assertEqual(marks[str(decoy)], "no")
+
+    def _parser_path(self, parser):
+        bindir = self.root / f"bin-{parser}"
+        bindir.mkdir()
+        for cmd in (
+            "bash", "git", "sed", "head", "date", "awk", "mktemp", "rm",
+            "sort", "du", "grep", parser,
+        ):
+            found = shutil.which(cmd)
+            if found is None:
+                self.skipTest(f"{cmd} is not installed")
+            (bindir / cmd).symlink_to(found)
+        return str(bindir)
+
+    def test_symlinked_setting_matches_the_physical_worktree(self):
+        t3_home = self.root / "t3home"
+        custom = self.root / "custom"
+        alias = self.root / "alias"
+        root_link = self.root / "root-link"
+        direct = custom / "wt"
+        via_alias = alias / "created-via-alias"
+        outside = self.root / "outside" / "wt"
+        default = t3_home / "worktrees" / "wt"
+        _add_worktree(self.repo, direct, "b-direct")
+        alias.symlink_to(custom, target_is_directory=True)
+        _add_worktree(self.repo, via_alias, "b-alias")
+        _add_worktree(self.repo, outside, "b-out")
+        _add_worktree(self.repo, default, "b-default")
+        root_link.symlink_to(Path("/"))
+        (t3_home / "userdata").mkdir(parents=True)
+        settings = t3_home / "userdata" / "settings.json"
+        settings.write_text(json.dumps({"worktreesDirectory": str(alias)}))
+        marks = self._audit(T3CODE_HOME=str(t3_home))
+        self.assertEqual(marks[str(direct)], "yes")
+        self.assertEqual(marks[str(custom / "created-via-alias")], "yes")
+        self.assertEqual(marks[str(default)], "yes")
+        self.assertEqual(marks[str(outside)], "no")
+
+        settings.write_text(json.dumps({"worktreesDirectory": str(root_link)}))
+        marks = self._audit(T3CODE_HOME=str(t3_home))
+        self.assertEqual(marks[str(outside)], "no")
+        self.assertEqual(marks[str(default)], "yes")
+        self.assertEqual(marks[str(direct)], "no")
+
+    def test_bad_previous_field_is_ignored_by_each_parser(self):
+        t3_home = self.root / "t3home"
+        custom = self.root / "custom" / "wt"
+        outside = self.root / "outside" / "wt"
+        previous = self.root / "previous" / "wt"
+        default = t3_home / "worktrees" / "wt"
+        for path, branch in (
+            (custom, "b-custom"),
+            (outside, "b-out"),
+            (previous, "b-prev"),
+            (default, "b-default"),
+        ):
+            _add_worktree(self.repo, path, branch)
+        (t3_home / "userdata").mkdir(parents=True)
+        settings = t3_home / "userdata" / "settings.json"
+        bad_values = (
+            {"oops": str(outside.parent)},
+            "invalid",
+            12,
+            None,
+            [1, {"oops": str(outside.parent)}, str(previous.parent)],
+        )
+        parsers = [name for name in ("jq", "python3") if shutil.which(name)]
+        self.assertGreaterEqual(len(parsers), 1)
+        for parser in parsers:
+            tool_path = self._parser_path(parser)
+            for value in bad_values:
+                settings.write_text(json.dumps({
+                    "worktreesDirectory": str(custom.parent),
+                    "previousWorktreesDirectories": value,
+                }))
+                marks = self._audit(T3CODE_HOME=str(t3_home), PATH=tool_path)
+                self.assertEqual(marks[str(custom)], "yes", (parser, value))
+                self.assertEqual(marks[str(outside)], "no", (parser, value))
+                self.assertEqual(marks[str(default)], "yes", (parser, value))
+                expect_previous = "yes" if isinstance(value, list) else "no"
+                self.assertEqual(marks[str(previous)], expect_previous, (parser, value))
+
+    def test_padded_home_and_setting_count(self):
+        t3_home = self.root / "t3home"
+        home = self.root / "home"
+        custom = self.root / "custom" / "wt"
+        tilde_custom = home / "custom" / "wt"
+        outside = self.root / "outside" / "wt"
+        default = t3_home / "worktrees" / "wt"
+        _add_worktree(self.repo, custom, "b-custom")
+        _add_worktree(self.repo, tilde_custom, "b-tilde")
+        _add_worktree(self.repo, outside, "b-out")
+        _add_worktree(self.repo, default, "b-default")
+        (t3_home / "userdata").mkdir(parents=True)
+        settings = t3_home / "userdata" / "settings.json"
+        settings.write_text(json.dumps({
+            "worktreesDirectory": f"  {custom.parent}  ",
+        }))
+        marks = self._audit(T3CODE_HOME=f"  {t3_home}  ", HOME=str(home))
+        self.assertEqual(marks[str(default)], "yes")
+        self.assertEqual(marks[str(custom)], "yes")
+        self.assertEqual(marks[str(outside)], "no")
+
+        settings.write_text(json.dumps({"worktreesDirectory": "  ~/custom  "}))
+        marks = self._audit(T3CODE_HOME=f"  {t3_home}  ", HOME=str(home))
+        self.assertEqual(marks[str(tilde_custom)], "yes")
+        self.assertEqual(marks[str(custom)], "no")
+
+        marks = self._audit(T3CODE_HOME="   ", T3_HOME=str(t3_home), HOME=str(home))
+        self.assertEqual(marks[str(default)], "yes")
+
+    def test_javascript_whitespace_pad_counts_for_each_parser(self):
+        t3_home = self.root / "t3home"
+        custom = self.root / "custom" / "wt"
+        outside = self.root / "outside" / "wt"
+        default = t3_home / "worktrees" / "wt"
+        _add_worktree(self.repo, custom, "b-custom")
+        _add_worktree(self.repo, outside, "b-out")
+        _add_worktree(self.repo, default, "b-default")
+        (t3_home / "userdata").mkdir(parents=True)
+        settings = t3_home / "userdata" / "settings.json"
+        parsers = [name for name in ("jq", "python3") if shutil.which(name)]
+        self.assertEqual(parsers, ["jq", "python3"])
+        paths = {parser: self._parser_path(parser) for parser in parsers}
+        for pad in ("\u00a0", "\ufeff"):
+            for parser, tool_path in paths.items():
+                label = (parser, hex(ord(pad)))
+                settings.write_text(json.dumps({
+                    "worktreesDirectory": f"{pad}{custom.parent}{pad}",
+                }))
+                marks = self._audit(T3CODE_HOME=str(t3_home), PATH=tool_path)
+                self.assertEqual(marks[str(custom)], "yes", (*label, "setting"))
+                self.assertEqual(marks[str(default)], "yes", (*label, "setting"))
+                self.assertEqual(marks[str(outside)], "no", (*label, "setting"))
+
+                settings.write_text(json.dumps({
+                    "worktreesDirectory": str(custom.parent),
+                }))
+                marks = self._audit(
+                    T3CODE_HOME=f"{pad}{t3_home}{pad}",
+                    PATH=tool_path,
+                )
+                self.assertEqual(marks[str(custom)], "yes", (*label, "home"))
+                self.assertEqual(marks[str(default)], "yes", (*label, "home"))
+                self.assertEqual(marks[str(outside)], "no", (*label, "home"))
+
+    def test_playbook_names_the_configured_worktree_location(self):
+        text = (ROOT / "t3/overrides/poteto-mode/playbooks/worktree-cleanup.md").read_text()
+        self.assertIn("worktreesDirectory", text)
+        self.assertIn("--t3-worktrees", text)
+        self.assertIn("T3_WORKTREES", text)
+        self.assertIn("replaces those settings roots", text)
+
+
+def runtime_section(start, end="\n## "):
+    text = (ROOT / "t3/runtime.md").read_text()
+    return text.split(start, 1)[1].split(end, 1)[0]
+
+
+def _context_catalog(provider_id, model_options):
+    return {
+        "providers": [{
+            "providerInstanceId": provider_id,
+            "canRunChildTask": True,
+            "constraints": [],
+            "models": [{"id": "claude-opus-5-5", "options": model_options}],
+        }],
+    }
+
+
+_EFFORT_OPTION = {
+    "id": "effort",
+    "type": "select",
+    "options": [{"id": "low"}, {"id": "medium"}, {"id": "high"}, {"id": "xhigh"}, {"id": "max"}],
+}
+_WINDOW_OPTION = {
+    "id": "contextWindow",
+    "type": "select",
+    "options": [{"id": "300k"}, {"id": "1m"}],
+}
+
+
+class ThreadLifecycleDocTest(unittest.TestCase):
+    def test_history_names_snooze_fields_and_filter(self):
+        section = runtime_section("## History")
+        for sentence in (
+            "`t3_thread_list` and `t3_thread_read` report `snoozed` and `snoozedUntil`.",
+            "Pass `snoozed: true` to `t3_thread_list` to find snoozed owners.",
+            '`t3_thread_organize` with `action: "snooze"` requires `snoozedUntil`.',
+            "A snoozed thread wakes early when it asks for something, fails, or completes.",
+            "Snooze is a sidebar state.",
+            "It is not a schedule, a completion, or a settle.",
+            "Wait with `schedule_task` or `watch_pull_request`, never with `snoozedUntil`.",
+        ):
+            self.assertIn(sentence, section)
+
+    def test_history_states_the_thread_link_in_a_form_check_accepts(self):
+        section = runtime_section("## History")
+        self.assertIn("whose target is `t3-thread://v1/<threadId>`", section)
+        self.assertIn("Do not URL-encode it, decode its `%` escapes, or add an environment ID.", section)
+        self.assertIn("carry no `link` field", section)
+        launch = runtime_section("## Top-level threads")
+        self.assertIn("Report it to the user as a thread link per [History](#history).", launch)
+        self.assertEqual(check.LINK.findall("[t](t3-thread://v1/abc)"), ["t3-thread://v1/abc"])
+        targets = check.LINK.findall((ROOT / "t3/runtime.md").read_text())
+        self.assertFalse(any(target.startswith("t3-thread:") for target in targets))
+
+    def test_self_settle_is_a_request_not_a_settle(self):
+        section = runtime_section("## Pull request watching")
+        for phrase in (
+            "`settlesWhenTurnEnds: true`",
+            "an accepted request, not a settled thread",
+            "or a queued message, leaves the thread active",
+            "a T3 restart before the turn ends drops the request",
+            "Never settle an owner whose PR watch or `schedule_task` loop is still needed",
+        ):
+            self.assertIn(phrase, section)
+
+    def test_isolation_names_the_settle_action(self):
+        section = runtime_section("## Isolation")
+        for phrase in (
+            "T3 runs the first effective project action with `runOnSettle: true`",
+            "A thread in the main checkout skips it.",
+            "The effective list is the project's override, else the environment defaults.",
+            "Actions in a repository `t3.json` count only once imported into project settings",
+            "`t3_project_read` returns the project's saved `scripts`, which can differ from the effective list.",
+            "Take `projectSettingsOverrides.<projectId>.defaultProjectScripts` when present, else `defaultProjectScripts`",
+            "When `projectSettingsFolded` is not `true`, older saved lists still count",
+            "never schedule a tick to watch for it",
+            "T3 storage cleanup can remove that worktree after the thread ends.",
+        ):
+            self.assertIn(phrase, section)
+        self.assertNotIn("Read `t3.json` before you settle", section)
+
+    def test_local_state_does_not_promise_worktrees_persist(self):
+        section = runtime_section("## Local state")
+        self.assertNotIn("Pushed branches, worktrees, launched threads, and schedules persist.", section)
+        self.assertIn("unless the project enables storage cleanup", section)
+        self.assertIn("by squash or rebase at the worktree's head SHA", section)
+        self.assertIn("check that `worktreePath` exists before you use a saved path", section)
+
+
+class FixedContextWindowTest(unittest.TestCase):
+    def _entry(self, provider_id, model_options, saved_options):
+        seat = {"providerInstanceId": provider_id, "model": "claude-opus-5-5", "options": saved_options}
+        catalog = _context_catalog(provider_id, model_options)
+        return roles.resolve(config(**{"judgment and prose": [seat]}), catalog, ["judgment and prose"])["roles"]["judgment and prose"]
+
+    def test_native_claude_5_drops_a_saved_context_window(self):
+        entry = self._entry("claudeAgent", [_EFFORT_OPTION], {"effort": "xhigh", "contextWindow": "1m"})
+        self.assertEqual(entry["seats"], [OPUS_SEAT])
+        self.assertEqual(entry["notes"], ["dropped unknown options contextWindow"])
+        setup = (ROOT / "t3/setup.md").read_text()
+        self.assertIn("`dropped unknown options contextWindow`", setup)
+        self.assertIn("0.0.46-nightly.20261008.2801", setup)
+
+    def test_keeps_context_window_when_the_catalog_offers_it(self):
+        saved = {"effort": "xhigh", "contextWindow": "1m"}
+        entry = self._entry("claudeAgent", [_EFFORT_OPTION, _WINDOW_OPTION], saved)
+        self.assertEqual(entry["seats"], [{"providerInstanceId": "claudeAgent", "model": "claude-opus-5-5", "options": saved}])
+        self.assertNotIn("notes", entry)
+        setup = (ROOT / "t3/setup.md").read_text()
+        self.assertIn("Write `contextWindow` only for a model whose catalog entry offers it.", setup)
+
+    def test_cursor_claude_5_keeps_a_saved_context_window(self):
+        saved = {"effort": "xhigh", "contextWindow": "300k"}
+        entry = self._entry("cursor", [_EFFORT_OPTION, _WINDOW_OPTION], saved)
+        self.assertEqual(entry["seats"], [{"providerInstanceId": "cursor", "model": "claude-opus-5-5", "options": saved}])
+        self.assertNotIn("notes", entry)
+        self.assertEqual(entry["seats"][0]["options"]["contextWindow"], "300k")
+        setup = (ROOT / "t3/setup.md").read_text()
+        self.assertIn("Cursor's Claude 5 models still offer it.", setup)
+
+    def test_prompt_caps_state_the_fixed_native_context(self):
+        section = runtime_section("### Prompt caps")
+        self.assertIn("fixed 1M-token context and offer no `contextWindow` option", section)
+        self.assertIn("The cap is about price, not capacity", section)
+
+
+class LaunchingSkillTestDocTest(unittest.TestCase):
+    def test_prompt_caps_send_a_seat_launching_test_through_launches_seats(self):
+        section = runtime_section("### Prompt caps")
+        step1 = section.split("\n1. ", 1)[1].split("\n2. ", 1)[0]
+        step4 = section.split("\n4. ", 1)[1]
+        for phrase in (
+            "stays on the `show` seat, unless its child will launch seats.",
+            "passes a `target` to `delegate_task` or `t3_thread_launch`",
+            "When the skill-test child will launch seats, pass `--launches-seats` to `roles.py bounded-seat`.",
+            "never cursor",
+            "still applies the Haiku prompt cap",
+            "`show` has no such flag and can still return a cursor seat.",
+        ):
+            self.assertIn(phrase, step1)
+        self.assertIn(
+            "Rerun a child that launches seats on `inherit`, and every other child on the `show` seat.",
+            step4,
+        )
+
+
+class MuseDocTest(unittest.TestCase):
+    def test_runtime_names_muse_and_limits_its_modes(self):
+        runtime = (ROOT / "t3/runtime.md").read_text()
+        intro = next(line for line in runtime.splitlines() if "Every provider T3 drives" in line)
+        self.assertIn("OpenCode, Muse, ACP agents", intro)
+        permissions = runtime_section("### Permissions", "\n### ")
+        self.assertIn("Muse supports only `approval-required` and `full-access`.", permissions)
+        self.assertIn("Read `runtimeMode` from `orchestrator_capabilities` before you seat Muse.", permissions)
+        self.assertIn('replace the Muse seat with `"inherit"` per [Fallback](#fallback)', permissions)
+        self.assertIn("never lower it", permissions)
+
+    def test_skill_locations_exclude_muse_from_the_picker(self):
+        section = runtime_section("## Skill locations")
+        self.assertIn("except Muse's", section)
+        self.assertIn("`muse skills`", section)
+
+    def test_setup_does_not_treat_a_cached_muse_catalog_as_proof(self):
+        text = (ROOT / "t3/setup.md").read_text()
+        step1 = text.split("### 1. Check the host", 1)[1].split("\n### 2. ", 1)[0]
+        self.assertIn("does not prove a Muse seat works", step1)
+        self.assertIn('`driverKind: "muse"`', step1)
+        step5 = text.split("### 5. Verify", 1)[1].split("\n### 6. ", 1)[0]
+        self.assertIn("does not prove a Muse child can work under this thread's runtime mode", step5)
+        self.assertIn("(../pstack-runtime/SKILL.md#permissions)", step5)
+
+
+class PreviewToolDocTest(unittest.TestCase):
+    def test_runtime_names_hover_drag_select_upload_and_dialog(self):
+        text = (ROOT / "t3/runtime.md").read_text()
+        row = next(line for line in text.splitlines() if "control-ui, browser MCP" in line)
+        bullet = next(line for line in text.splitlines() if line.startswith("- Web or Electron UI:"))
+        for name in PREVIEW_TOOLS:
+            self.assertIn(name, row)
+            self.assertIn(name, bullet)
+
+
+class StalledChildDocTest(unittest.TestCase):
+    def test_delegation_step_5_bounds_an_open_child(self):
+        text = (ROOT / "t3/runtime.md").read_text()
+        step = text.split("5. Collect results.", 1)[1].split("6. You own every child's output.", 1)[0]
+        self.assertIn("t3_thread_wait", step)
+        self.assertIn("timeoutMs: 300000", step)
+        self.assertIn("does not end its turn while a child is open", step)
+
+    def test_delegation_step_5_rechecks_a_final_result_after_two_minutes(self):
+        step = runtime_section("5. Collect results.", "\n6. You own")
+        ten = "A child with no new item for 10 minutes is stalled."
+        two = "no pending tool or child run, and no new activity for two minutes is stalled."
+        for phrase in (
+            two,
+            "A message that says more work follows does not hold the result.",
+            "After you see that message while the child's run is still open",
+            "with `timeoutMs: 120000`",
+            "only when the wait timed out, `workState` is still `working`, "
+            "that message is still the last item, and no tool or child run is pending.",
+            "Otherwise the 10-minute rule above decides that child.",
+            ten,
+        ):
+            self.assertIn(phrase, step)
+        self.assertLess(step.index(ten), step.index(two))
+
+    def test_delegation_step_5_holds_against_the_delegate_task_tool_text(self):
+        step = runtime_section("5. Collect results.", "\n6. You own")
+        stay = "does not end its turn while a child is open"
+        holds = "This holds even though the `delegate_task` tool text says to end the turn."
+        self.assertIn(holds, step)
+        self.assertLess(step.index(stay), step.index(holds))
+
+    def test_failure_handling_keeps_the_two_minute_clock_out(self):
+        section = runtime_section("### Failure handling", "### Fresh children by default")
+        self.assertNotIn("two minutes", section)
+        self.assertNotIn("120000", section)
+        self.assertIn("holds the result the brief asked for", section)
+
+    def test_permissions_never_lowers_runtime_mode(self):
+        text = (ROOT / "t3/runtime.md").read_text()
+        section = text.split("### Permissions", 1)[1].split("### Failure handling", 1)[0]
+        self.assertIn("never lower it", section)
+
+    def test_failure_handling_names_a_stalled_child(self):
+        text = (ROOT / "t3/runtime.md").read_text()
+        section = text.split("### Failure handling", 1)[1].split("### Fresh children by default", 1)[0]
+        self.assertIn("A stalled child", section)
+
+    def test_no_source_tells_a_parent_to_end_its_turn_on_an_open_child(self):
+        unbounded = re.compile(r"completion notifications? wakes?|let (?:each|the) completion|end the turn rather than wait"
+                               r"|`mode: \"async\"`,? and end the turn")
+        found = [f"{path.relative_to(ROOT)}:{number}"
+                 for path in sorted((ROOT / "t3").rglob("*.md"))
+                 for number, line in enumerate(path.read_text().splitlines(), 1) if unbounded.search(line)]
+        self.assertEqual(found, [])
+
+    def test_routed_skills_collect_children_per_delegation_step_5(self):
+        sources = {
+            "how/SKILL.md": "../pstack-runtime", "arena/SKILL.md": "../pstack-runtime",
+            "interrogate/SKILL.md": "../pstack-runtime", "swarm/SKILL.md": "../pstack-runtime",
+            "why/SKILL.md": "../pstack-runtime", "no-comments/SKILL.md": "../pstack-runtime",
+            "poteto-mode/playbooks/orchestrate.md": "../../pstack-runtime",
+            "poteto-mode/playbooks/feature.md": "../../pstack-runtime",
+            "poteto-mode/playbooks/bug-fix.md": "../../pstack-runtime",
+            "poteto-mode/playbooks/refactoring.md": "../../pstack-runtime",
+            "poteto-mode/playbooks/perf-issue.md": "../../pstack-runtime",
+        }
+        missing = [name for name, runtime in sources.items()
+                   if f"Delegation step 5]({runtime}/SKILL.md#delegation)" not in (ROOT / "t3/overrides" / name).read_text()]
+        self.assertEqual(missing, [])
+
+    def test_failure_handling_decides_completion_by_work_state(self):
+        section = runtime_section("### Failure handling", "\n### ")
+        self.assertNotIn("that child is still running nested work", section)
+        for phrase in (
+            "Decide completion by `workState` alone.",
+            "it does not reopen the task",
+            "0.0.46-nightly.20261008.2813",
+            "startup recovery",
+            "a turn held in a stopped queue does not count",
+            "A stalled child",
+        ):
+            self.assertIn(phrase, section)
+        step = runtime_section("5. Collect results.", "\n6. You own")
+        self.assertIn("`hasPendingChildRuns` does not change that.", step)
+
+    def test_local_state_reads_a_finished_result_after_restart(self):
+        section = runtime_section("## Local state")
+        self.assertIn("A task in `result_available` finished", section)
+        self.assertIn("before you respawn its slice", section)
+
+
+class SeatLaunchDocTest(unittest.TestCase):
+    def setUp(self):
+        self.runtime = (ROOT / "skills/pstack-runtime/SKILL.md").read_text()
+
+    def test_mapping_sentence_renames_provider_instance_id_and_copies_options(self):
+        section = self.runtime.split("## Top-level threads", 1)[1].split("\n## ", 1)[0]
+        self.assertIn(
+            "`modelSelection` is the seat with `providerInstanceId` renamed to `instanceId`, "
+            "`model` copied, and `options` copied unchanged as the same object, "
+            "including a boolean such as `{\"fastMode\": true}`.",
+            section,
+        )
+        self.assertIn('"options": {"effort": "xhigh"}', section)
+        self.assertIn("Confirm a launched thread per [Delegation](#delegation) step 3.", section)
+
+    def test_readback_sentence_names_where_to_read_and_never_retries_without_options(self):
+        step = self.runtime.split("3. Spawn every independent child", 1)[1].split("\n4. A child starts", 1)[0]
+        self.assertIn(
+            "After a `t3_thread_launch` or `delegate_task` call whose seat has `options`, "
+            "read the applied options from the launch result's `modelSelection.options` or from "
+            "`t3_thread_configuration` on the child's `childThreadId`, and never call again with the options removed.",
+            step,
+        )
 
 
 if __name__ == "__main__":

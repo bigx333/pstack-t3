@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Lint a generated skills tree for Cursor-only leftovers and broken structure."""
 
+import importlib.util
 import re
 import sys
 
@@ -23,16 +24,86 @@ FORBIDDEN = [
     (r"cursor-team-kit|Cursor's built-in", "Cursor plugin dependency"),
     (r"agent-transcripts", "Cursor transcript store; use t3_thread_search and t3_thread_read"),
     (r"inherit-parent", "Cursor alias; use inherit"),
-    (r"\b(?:claude-opus-5-5-max|claude-fable-5-1-thinking-\w+|gpt-5\.6-sol-max|grok-4\.7-xhigh-fast|claude-opus-5-thinking-\w+)\b", "hard-coded Cursor model slug; resolve a role"),
+    (r"\b(?:claude-opus-5-5-max|claude-opus-5-5-xhigh|claude-fable-5-1-thinking-\w+|gpt-5\.6-sol-max|grok-4\.7-xhigh-fast|claude-opus-5-thinking-\w+)\b", "hard-coded Cursor model slug; resolve a role"),
     (r"cursor\.com/agents|cloud agent", "Cursor cloud agents; T3 child tasks or threads"),
 ]
 FRONTMATTER_REQUIRED = ("name", "description")
+# Generated files that teach a PR wait must name T3's watch tools. Absent files are not checked.
+REQUIRED_TOOLS = {
+    "pstack-runtime/SKILL.md": ("watch_pull_request", "unwatch_pull_request"),
+    "landing/SKILL.md": ("watch_pull_request", "unwatch_pull_request"),
+    "brigade/SKILL.md": ("watch_pull_request", "unwatch_pull_request"),
+    "poteto-mode/playbooks/babysit.md": ("watch_pull_request",),
+    "poteto-mode/playbooks/shipping.md": ("watch_pull_request",),
+    "poteto-mode/playbooks/autonomous-run.md": ("watch_pull_request",),
+    "poteto-mode/playbooks/orchestrate.md": ("watch_pull_request",),
+    "poteto-mode/playbooks/autopilot-full.md": ("watch_pull_request",),
+    "poteto-mode/playbooks/autopilot-stack.md": ("watch_pull_request",),
+    "setup-pstack/SKILL.md": ("watch_pull_request", "0.0.46-nightly.20261005.2702"),
+}
 LINK = re.compile(r"\]\(((?!https?:|mailto:|#)[^)\s]+)\)")
+# Bash ends a <<'JSON' body only on a line that is JSON and nothing else.
+CATALOG_HEREDOC_OPEN = "<<'JSON'"
+CATALOG_HEREDOC_CLOSER = "JSON"
+
+ROLES_PY = Path(__file__).resolve().parents[1] / "t3/scripts/roles.py"
+LIGHT_HEADER_CELLS = frozenset({"light", "light mode", "light behavior", "in light mode"})
+LIGHT_MODE_NAME = re.compile(r"(?i:\blight mode\b)|Mode: light")
+TABLE_SEPARATOR = re.compile(r"\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)*\|?")
+
+
+def light_waiver_cells():
+    spec = importlib.util.spec_from_file_location("pstack_roles", ROLES_PY)
+    roles = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(roles)
+    return tuple(sorted({", ".join(steps) for steps in roles.LIGHT_WAIVERS.values() if len(steps) >= 2}))
+
+
+def _header_cells(line):
+    return [cell.replace("`", "").replace("*", "").strip().casefold() for cell in line.strip().strip("|").split("|")]
+
+
+def light_table_findings(rel_s, text, cells):
+    findings = []
+    lines = text.splitlines()
+    for number, line in enumerate(lines, 1):
+        restated = any(cell in line for cell in cells)
+        if line.lstrip().startswith("|") and number < len(lines) and TABLE_SEPARATOR.fullmatch(lines[number].strip()):
+            header = _header_cells(line)
+            restated = restated or bool(LIGHT_HEADER_CELLS.intersection(header)) or (
+                "playbook" in header and any(cell == "first" or cell.startswith("fix") for cell in header)
+            )
+        if restated:
+            findings.append(f"{rel_s}:{number}: light table restated. Link pstack-runtime/SKILL.md#modes instead of pasting it: {line.strip()[:120]}")
+        elif LIGHT_MODE_NAME.search(line) and "pstack-runtime/SKILL.md#" not in line:
+            findings.append(f"{rel_s}:{number}: names light mode without a link to the runtime's Modes section. Link pstack-runtime/SKILL.md#modes: {line.strip()[:120]}")
+    return findings
+
+
+def catalog_heredoc_findings(rel, text):
+    findings = []
+    in_body = False
+    for number, line in enumerate(text.splitlines(), 1):
+        if not in_body:
+            if CATALOG_HEREDOC_OPEN in line:
+                in_body = True
+            continue
+        if line == CATALOG_HEREDOC_CLOSER:
+            in_body = False
+            continue
+        if line.strip() != CATALOG_HEREDOC_CLOSER:
+            continue
+        if line.lstrip() != line:
+            findings.append(f"{rel}:{number}: catalog heredoc closer JSON is indented. Put JSON at column 0")
+        else:
+            findings.append(f"{rel}:{number}: catalog heredoc closer JSON has trailing whitespace. The closer is JSON with nothing after it")
+    return findings
 
 
 def check_tree(root):
     root = Path(root)
     findings = []
+    cells = light_waiver_cells()
     for skill_md in sorted(root.glob("*/SKILL.md")):
         skill = skill_md.parent.name
         text = skill_md.read_text()
@@ -61,13 +132,20 @@ def check_tree(root):
             continue
         rel = file.relative_to(root)
         text = file.read_text()
+        rel_s = str(rel)
+        for tool in REQUIRED_TOOLS.get(rel_s, ()):
+            if tool not in text:
+                findings.append(f"{rel_s}: missing {tool}")
         # The runtime's vocabulary table names each Cursor term it replaces.
-        patterns = [] if str(rel) == "pstack-runtime/SKILL.md" else FORBIDDEN
+        patterns = [] if rel_s == "pstack-runtime/SKILL.md" else FORBIDDEN
         for number, line in enumerate(text.splitlines(), 1):
             for pattern, why in patterns:
                 if re.search(pattern, line):
                     findings.append(f"{rel}:{number}: {why}: {line.strip()[:120]}")
+        findings.extend(catalog_heredoc_findings(rel, text))
         if file.suffix == ".md":
+            if rel_s != "pstack-runtime/SKILL.md":
+                findings.extend(light_table_findings(rel_s, text, cells))
             for target in LINK.findall(text):
                 path = target.split("#", 1)[0]
                 # Template placeholders such as (url) are not paths.

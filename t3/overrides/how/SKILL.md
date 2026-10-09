@@ -10,6 +10,8 @@ Explore the codebase to answer "how does X work?" questions. Produce architectur
 
 Each spawn below names a role, resolved per [the runtime's Roles section](../pstack-runtime/SKILL.md#roles) with `python3 <pstack-runtime>/scripts/roles.py show --cwd "$PWD" --parent "<inheritedProviderInstanceId>/<inheritedModel>" --role "<role>"`. Set `target` to the role's seat, or omit `target` when the seat is `inherit`. If `delegate_task` rejects a target, apply the runtime's fallback and say which seat changed and why. Every spawn uses `mode: "async"`, a stable `clientRequestId` such as `how-<slug>-<angle>`, and a read-only brief. The prompt templates tell the child not to edit files, commit, or push. Retain every returned `taskId`.
 
+[The runtime's Modes section](../pstack-runtime/SKILL.md#modes) sets the mode lines of every brief this skill writes and how its spawns run in light mode.
+
 ## Step 1. Assess Complexity
 
 If the scope is ambiguous, state your interpretation and explore. The user can redirect.
@@ -39,7 +41,7 @@ Build its prompt from `references/explainer-prompt.md` without the explorer-find
 
 ## Step 3. Synthesize (complex questions only)
 
-Once all explorers have returned (end the turn and let the completion notifications wake you, or check `task_status`), spawn one child task to synthesize their findings into one explanation:
+Once all explorers have returned (collect them per [the runtime's Delegation step 5](../pstack-runtime/SKILL.md#delegation)), spawn one child task to synthesize their findings into one explanation:
 
 - `delegate_task` with `role`: `"general"`
 - `target`: the `how explainer` role

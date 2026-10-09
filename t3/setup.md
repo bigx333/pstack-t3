@@ -1,6 +1,6 @@
 ---
 name: setup-pstack
-description: Configure which T3 providers and models pstack uses per role and at what reasoning budget. Reads the live T3 catalog and writes a roles file that every pstack skill reads. Use for /setup-pstack, "configure pstack models", "pstack budget", or changing pstack's model choices.
+description: Configure which T3 providers and models pstack uses per role, at what reasoning budget, and whether mode is full or light. Reads the live T3 catalog and writes a roles file that every pstack skill reads. Use for /setup-pstack, "configure pstack models", "pstack budget", "pstack mode", or changing pstack's model choices.
 ---
 
 # Setup pstack
@@ -11,11 +11,15 @@ Write `~/.config/pstack-t3/roles.json`, the per-role seat table that every pstac
 
 ## Steps
 
-### 1. Read the catalog
+### 1. Check the host and read the catalog
 
-Call `orchestrator_capabilities`. Save its JSON result verbatim to a temporary file, for example `/tmp/pstack-t3-catalog.json`. That file is the only source of valid providers, models, and options. Never write a seat that is not in it.
+Check the host's tool list for `watch_pull_request`. Accept the T3 harness prefixes described in [the runtime](../pstack-runtime/SKILL.md). A tool listed by name counts as present, including a harness prefix. A deferred `watch_pull_request` counts as present and does not fail this gate. If tools load lazily, use the host's tool discovery and make one bounded `orchestrator_capabilities` call before checking again. A provider catalog does not prove that the watch tool exists. Do not call `watch_pull_request` with a dummy PR to test it.
 
-List the runnable providers (`canRunChildTask: true`) with their first three models. List the providers that are not runnable with their `constraints`, such as "Provider is not authenticated", so the user knows what to fix in T3 settings.
+If `watch_pull_request` is absent, stop setup before writing roles or a saved catalog. Say "Setup cannot finish. T3 Code 0.0.46-nightly.20261005.2702 or later is required because this host does not expose watch_pull_request." Ask the user to update T3 Code and rerun setup. Do not report setup complete.
+
+Call `orchestrator_capabilities`. Save its JSON result verbatim to a temporary file, for example `/tmp/pstack-t3-catalog.json`. That file is the only source of valid providers, models, and options. Never write a seat that is not in it. Keep the file for the commands in this skill. `show` and `write` both read it, and a user-level `write` saves a copy as the snapshot. A skill that only resolves a role from a tool result uses the quoted heredoc in [Where roles live](../pstack-runtime/SKILL.md#where-roles-live) instead of a file.
+
+List the runnable providers (`canRunChildTask: true`) with their first three models. List the providers that are not runnable with their `constraints`, such as "Provider is not authenticated", so the user knows what to fix in T3 settings. Muse is beta and disabled by default. Its status can come from a cached catalog without a login or model check, so `canRunChildTask: true` does not prove a Muse seat works. Step 5's smoke delegation decides it. Match a Muse instance by `driverKind: "muse"`, not by the ID `muse`.
 
 ### 2. Load current state
 
@@ -23,28 +27,28 @@ List the runnable providers (`canRunChildTask: true`) with their first three mod
 python3 <runtime>/scripts/roles.py show --cwd "$PWD" --catalog /tmp/pstack-t3-catalog.json
 ```
 
-This prints every role with its seats and `source` (`default`, the user file, or the project file), already resolved against the catalog. `notes` name seats that no longer match, such as a model T3 dropped.
+This prints every role with its seats and `source` (`default`, the user file, or the project file), already resolved against the catalog. It also prints `mode`, `modeSource`, and `escalate`. `notes` name seats that no longer match, such as a model T3 dropped. A saved `contextWindow` on a native Claude 5 seat shows as `dropped unknown options contextWindow`, because T3 Code 0.0.46-nightly.20261008.2801 fixed those models at 1M context. Rewrite that seat without it in step 4.
 
 ### 3. Budget, map, and confirm
 
 **(a) Ask for a budget.** Use the host's question tool if it has one. Offer these labels, and name the current budget.
 
-- `default — each model's own default reasoning`
-- `unlimited — highest reasoning each model offers`
+- `default — built-in role reasoning or configured seat options`
+- `unlimited — max reasoning`
 - `large — xhigh reasoning`
 - `medium — high reasoning`
 - `small — medium reasoning`
 
-The budget sets the reasoning option (`effort`, `reasoningEffort`, `reasoning_effort`, or `reasoning`) of every seat to its level, or the closest lower level the model offers. A seat that names a lower level keeps it. A model without such an option is unaffected. `ultracode` and `ultrathink` are never set by a budget.
+The budget caps the reasoning option (`effort`, `reasoningEffort`, `reasoning_effort`, or `reasoning`). A seat at or below the cap keeps its level. A seat above the cap drops to the cap, or the closest lower level the model offers. A seat that names no level receives the cap. `default` leaves a built-in or configured level as it is. The ladder stops at max. `unlimited` raises a built-in preferred seat to the model's highest level at or below max. The default Opus seat moves from xhigh to max. Grok's ladder tops out at xhigh, so the default Grok seat stays at xhigh. `unlimited` lowers a configured `ultra` seat to max when the model offers a level at or below max. `default` keeps a configured `ultra` seat. When every offered level is above the cap, the seat gets the lowest level. A configured seat that names its own level keeps that level when it is at or below the cap. A model without such an option is unaffected. `ultracode` and `ultrathink` are never set by a budget.
 
-**(b) Propose roles.** Start from the current state. Then suggest a split by strength that uses only runnable providers. A good default when several providers are runnable:
+**Ask for a mode.** Use the host's question tool. Name the current `mode` and `modeSource` from step 2. Offer these options, in this order.
 
-- Code roles (`feature, refactoring`, `bug-fix`, `perf-issue`, `hillclimb`, `swarm workers`, `how explorer`, `why investigators`): the fastest strong coding model the user has.
-- Judgment roles (`judgment and prose`, `hardest tasks`, `how explainer`, `why synthesizer`, `reflect judgment, divergent, synthesizer`): the strongest reasoning model.
-- `reflect tooling`: a model from a different model family than the judgment model.
-- Panel roles (`arena runners`, `arena cross-judge pool`, `architect runners`, `interrogate reviewers`, `verifiers`): one seat per model family (Claude, GPT, Grok, Gemini, and so on), each on a runnable provider. One provider can serve several families, and two providers can serve the same one, so count families, not providers.
+- `full — recommended when no provider is near its limit`
+- `light`
 
-Say which model you picked for each tier and why, in one line each. Marking a role `inherit` means it runs on whatever model the calling thread uses.
+Store the chosen value beside the budget. When the write target is the project file, name the current `escalate` from `show`. `null` means none. Suggest `**/migrations/**` plus that repository's own lock and installer scripts. In this repository those scripts are `t3/added/landing/scripts/land.py`, `t3/added/brigade/scripts/brigade.py`, and `scripts/install.py`. Do not suggest those three paths for any other repository. Pass one `--escalate` per pattern the user keeps. Omitting both escalate flags leaves a stored project list in place. `--clear-escalate` removes it.
+
+**(b) Propose roles.** The built-in defaults are Claude Opus (`claude-opus-5-5`) at xhigh for judgment roles and Grok (`grok-4.7`) at xhigh for code roles. Under `unlimited`, those seats rise as step 3(a) describes. Opus moves to max, and Grok stays at xhigh. `arena runners`, `arena cross-judge pool`, `architect runners`, and `interrogate reviewers` use those two seats, judgment first. `skill tests` and `verifiers` stay on their catalog rules. Start from `roles.py show` in step 2. Keep configured roles unless the user changes them. Use the built-in seats for roles with `source: "default"`. Offer `large` for a new setup. It matches the built-in xhigh ceiling. Show each fallback note beside its role and seat. Codex and every other runnable configured provider remain available as user choices. Leave `skill tests` unset so its adaptive default stays. Claude Haiku 5.5 is capped at 100,000 prompt tokens per [the runtime's Prompt caps](../pstack-runtime/SKILL.md#prompt-caps). `write` refuses it for every role but `skill tests`. `show` never returns it. A skill test reaches it only through `roles.py bounded-seat`, when the estimated prompt is at or under 100,000 tokens.
 
 **(c) Confirm.** Show every role with its seats. Ask whether to accept as-is or change specific roles. For panel roles the seat count is the panel size.
 
@@ -53,26 +57,26 @@ Say which model you picked for each tier and why, in one line each. Marking a ro
 Build one `--set` per role you are writing. A seat is `inherit` or `provider/model`, with options as a query string. Separate panel seats with `;`.
 
 ```bash
-python3 <runtime>/scripts/roles.py write --catalog /tmp/pstack-t3-catalog.json --budget large \
-  --set "judgment and prose=claudeAgent/claude-opus-5-5?effort=max" \
-  --set "swarm workers=grok/grok-4.7" \
-  --set "interrogate reviewers=inherit;codex/gpt-6.1-sol;grok/grok-4.7"
+python3 <runtime>/scripts/roles.py write --catalog /tmp/pstack-t3-catalog.json --budget large --mode full \
+  --set "judgment and prose=claudeAgent/claude-opus-5-5?effort=xhigh" \
+  --set "swarm workers=grok/grok-4.7?reasoningEffort=xhigh" \
+  --set "interrogate reviewers=claudeAgent/claude-opus-5-5?effort=xhigh;grok/grok-4.7?reasoningEffort=xhigh"
 ```
 
-The provider and model IDs above are examples. Use IDs from step 1.
+The provider, model, and option IDs above are examples. Use IDs from step 1. Add `fastMode` only when the chosen model is in the grok family and declares that boolean option. A fallback to another family does not set it. Write `contextWindow` only for a model whose catalog entry offers it. Cursor's Claude 5 models still offer it. T3's native Claude 5 models do not.
 
-- The command overwrites the whole file, so re-runs are idempotent. Add `--keep` to keep roles you did not pass.
+- The command overwrites the whole file, so re-runs are idempotent. Add `--keep` to keep roles you did not pass. A user write without `--mode` stores `full`. A project write without `--mode` omits the key. Omitting `--escalate` leaves a stored project list in place.
 - It refuses to write a seat that does not match the catalog and prints why. Fix the seat and rerun. Do not pass `--force` unless the user asks.
 - Add `--project` to write `.pstack/t3-roles.json` for this repository instead.
 - A user-level write also saves the catalog snapshot to `~/.config/pstack-t3/catalog.json`, which `roles.py show` uses later to resolve fallbacks.
 
 ### 5. Verify
 
-Run `python3 <runtime>/scripts/roles.py show --cwd "$PWD" --parent "<inheritedProviderInstanceId>/<inheritedModel>"` and check that every role shows the seats you wrote, with no `notes`. `info` lines, such as an `inherit` seat made explicit for the budget, are expected. Then run one smoke delegation to each distinct provider in the table: `delegate_task` with `mode: "wait"`, `timeoutMs: 120000`, the seat's target, and the task "Reply with the single word ready." A seat that fails here is not usable. Fix it and rerun step 4.
+Run `python3 <runtime>/scripts/roles.py show --cwd "$PWD" --parent "<inheritedProviderInstanceId>/<inheritedModel>"`. Check that configured seats resolve with no mismatch notes. For unset roles, review and report each default fallback note. A default fallback does not invalidate an otherwise runnable setup. `info` lines, such as an `inherit` seat made explicit for the budget, are expected. Then run one smoke delegation to each distinct provider in the table: `delegate_task` with `mode: "wait"`, `timeoutMs: 120000`, the seat's target, and the task "Reply with the single word ready." A seat that fails here is not usable. Fix it and rerun step 4. The smoke task runs no command, so it does not prove a Muse child can work under this thread's runtime mode. Check that per [Permissions](../pstack-runtime/SKILL.md#permissions).
 
 ### 6. Confirm
 
-Tell the user which file was written, the budget, any provider they could enable in T3 settings to widen the panels, and that new sessions pick it up immediately. Re-running this skill updates it.
+Do this only after step 1 found `watch_pull_request` and step 5's smoke delegations succeeded. Tell the user which file was written, the budget, the mode, any provider they could enable in T3 settings to widen `verifiers`, and that new sessions pick it up immediately. Re-running this skill updates it.
 
 ### 7. Offer a verification skill (optional)
 

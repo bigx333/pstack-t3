@@ -11,6 +11,8 @@ Spawn one reviewer per configured model to adversarially review code changes. Ea
 
 The deliverable is a synthesized verdict. Do NOT auto-apply changes.
 
+[The runtime's Modes section](../pstack-runtime/SKILL.md#modes) sets the mode lines of every brief this skill writes and how its spawns run in light mode.
+
 ## Step 1, Determine Scope
 
 Identify what to review from context:
@@ -34,7 +36,15 @@ Write one clear paragraph. If you're unsure about the intent, ask the user befor
 
 ## Step 3, Spawn Reviewers
 
-Call `orchestrator_capabilities`, then resolve the `interrogate reviewers` role per [the runtime's Roles section](../pstack-runtime/SKILL.md#roles) with `python3 <pstack-runtime>/scripts/roles.py show --cwd "$PWD" --parent "<inheritedProviderInstanceId>/<inheritedModel>" --role "interrogate reviewers"`. One reviewer per seat, labeled Reviewer A, B, C, and onward. The seat count is the panel size.
+Call `orchestrator_capabilities`. Paste that tool result into this quoted heredoc. If the catalog result is large, save it to a temporary file with the host's file tool and pass that path to `--catalog`.
+
+```bash
+python3 <pstack-runtime>/scripts/roles.py show --cwd "$PWD" --catalog - --parent "<inheritedProviderInstanceId>/<inheritedModel>" --role "interrogate reviewers" <<'JSON'
+<the orchestrator_capabilities JSON>
+JSON
+```
+
+The quoted heredoc sends the JSON unchanged. The command does not write the catalog into the repository, and parallel children do not share a file. It resolves the `interrogate reviewers` role per [the runtime's Roles section](../pstack-runtime/SKILL.md#roles). One reviewer per seat, labeled Reviewer A, B, and onward. The seat count is the panel size.
 
 Launch all reviewers in a single message, one `delegate_task` call per seat:
 - `mode`: `"async"`
@@ -53,7 +63,7 @@ Read `references/reviewer-prompt.md` and fill in the template with:
 
 The same filled template goes to all reviewers, so every model applies the code-quality lens.
 
-End the turn and let each completion notification wake you, or call `task_status` with a retained `taskId`. If a reviewer fails or returns nothing usable, proceed with N-1 and record the dropout.
+Collect each reviewer's result per [the runtime's Delegation step 5](../pstack-runtime/SKILL.md#delegation). If a reviewer fails or returns nothing usable, proceed with N-1 and record the dropout.
 
 ## Step 4, Synthesize
 

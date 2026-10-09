@@ -19,6 +19,8 @@ Open a todolist with one entry per phase before starting.
 4. Implement
 5. Scrap
 
+[The runtime's Modes section](../pstack-runtime/SKILL.md#modes) sets the mode lines of every brief this skill writes and how its spawns run in light mode.
+
 ## Phase A: Ground the problem
 
 Build a real mental model of every system the new code touches. Run the **how** skill over the relevant subsystems.
@@ -31,7 +33,17 @@ Skip Phase A only when the work is genuinely greenfield with no surrounding syst
 
 Run the **arena** skill with the design-sketch task and the Phase A grounding artifacts. Pass `references/runner-prompt.md` as each runner's prompt. Each candidate produces a design package shaped per `references/rationale-template.md`.
 
-Take the runners from the `architect runners` role in place of the `arena runners` role, resolved per [the runtime's Roles section](../pstack-runtime/SKILL.md#roles) with `python3 <pstack-runtime>/scripts/roles.py show --cwd "$PWD" --parent "<inheritedProviderInstanceId>/<inheritedModel>" --role "architect runners"`. One runner per seat. The seat count is the panel size. `inherit` seats, fallbacks, and the report of which seats fell back and whether the models actually differed follow the runner rules in the **arena** skill's Phase A.
+The runner prompt tells each runner to read this skill in full first, so each runner's brief opens with a numbered read list whose first item is the absolute path of this `SKILL.md`, then `references/runner-prompt.md`, then the grounding. Before you accept a runner's design, call `t3_thread_read` with `view: "activity"` on its `childThreadId` and confirm a read of `architect/SKILL.md`. A runner that did not read it is rerun as a fresh child or discarded, and the synthesis record names it.
+
+Take the runners from the `architect runners` role in place of the `arena runners` role. Call `orchestrator_capabilities`. Paste that tool result into this quoted heredoc. If the catalog result is large, save it to a temporary file with the host's file tool and pass that path to `--catalog`.
+
+```bash
+python3 <pstack-runtime>/scripts/roles.py show --cwd "$PWD" --catalog - --parent "<inheritedProviderInstanceId>/<inheritedModel>" --role "architect runners" <<'JSON'
+<the orchestrator_capabilities JSON>
+JSON
+```
+
+The quoted heredoc sends the JSON unchanged. The command does not write the catalog into the repository, and parallel children do not share a file. It resolves the `architect runners` role per [the runtime's Roles section](../pstack-runtime/SKILL.md#roles). One runner per seat. The seat count is the panel size. `inherit` seats, fallbacks, and the report of which seats fell back and whether the models actually differed follow the runner rules in the **arena** skill's Phase A.
 
 Design it twice. Require at least two structurally distinct candidates before synthesis, even when the first looks sufficient. This is the **exhaust-the-design-space** principle skill made concrete. Whole-shape alternatives, not point fixes inside one shape.
 

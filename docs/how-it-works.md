@@ -11,10 +11,9 @@ flowchart TD
     runtime --> roles["roles.py<br/>role to seats, budget, fallbacks"]
     caps --> roles
     roles --> fan{"one delegate_task per seat"}
-    fan --> a["Reviewer A<br/>this thread's model"]
-    fan --> b["Reviewer B<br/>another model family"]
-    fan --> c["Reviewer C<br/>another model family"]
-    a & b & c -->|completion wakes the lead| synth["Lead verifies each claim,<br/>weighs cross-family agreement,<br/>writes one verdict"]
+    fan --> a["Reviewer A<br/>Claude Opus"]
+    fan --> b["Reviewer B<br/>Grok"]
+    a & b -->|completion wakes the lead| synth["Lead verifies each claim,<br/>weighs cross-family agreement,<br/>writes one verdict"]
 ```
 
 ## The layers
@@ -31,10 +30,11 @@ pstack never hard-codes a model. Each step names a role, and `roles.py` resolves
 
 | Role kind | Default |
 | --- | --- |
-| Single seat (`bug-fix`, `judgment and prose`, `swarm workers`, ...) | The lead thread's own model |
-| Panel (`interrogate reviewers`, `arena runners`, `verifiers`, ...) | The lead thread, then one seat per other model family you can run |
+| Single seat (`bug-fix`, `judgment and prose`, `swarm workers`, ...) | Unset single roles use Claude Opus (`claude-opus-5-5`) at xhigh for judgment and Grok (`grok-4.7`) at xhigh for code. `skill tests` prefers a model from another family for a fresh-child skill test. |
+| `arena runners`, `arena cross-judge pool`, `architect runners`, `interrogate reviewers` | Those two seats, Claude Opus then Grok |
+| `verifiers` | This thread's model plus one seat per other model family you can run. With one runnable model family, `verifiers` is three copies of one seat. That seat is this thread's model only when this thread's provider can run children. Otherwise that seat is the runnable provider's first model. |
 
-`$setup-pstack` writes your own choices to `~/.config/pstack-t3/roles.json`. A repository can override roles in `.pstack/t3-roles.json`. A reasoning budget (`small` to `unlimited`) sets each seat's effort. If a provider is signed out or a model disappears, the seat falls back and the skill says so.
+`$setup-pstack` writes your own choices to `~/.config/pstack-t3/roles.json`. A repository can override roles in `.pstack/t3-roles.json`. A reasoning budget (`small` to `unlimited`) sets each seat's effort. A seat whose model you cannot run falls back, and the report names each replacement.
 
 Diversity is counted by model family, not by provider, because one provider can serve another's models. Cursor can run Claude, for example.
 
@@ -47,9 +47,18 @@ Diversity is counted by model family, not by provider, because one provider can 
 | Long-lived owners (Autopilot, Orchestrate) | Separate T3 threads bound to their own worktree |
 | Overnight and recurring checks | `schedule_task` |
 | A standing coordinator (`$brigade`) | A pinned thread on the project root. It never writes code. Each unit runs in its own worktree thread. |
+| An executive admin (`$brigade`, optional) | A pinned thread on the project root. It serves every coordinator on one repository. It routes your requests and owns shared intake. It settles conflicts between coordinators by published rules. You can overrule any ruling. `land.py` reservations, shares, and contests carry out its rulings. It never runs work. See [An executive admin](guide.md#an-executive-admin). |
 | The landing queue (`$landing`) | One queue per repository. `land.py land` is the only writer to trunk. See [Landing modes](guide.md#landing-modes). |
 
-The lead ends its turn while children work. T3 wakes it as each one finishes. A coordinator's worktree threads send no completion notice. Its liveness check runs every 10 minutes while work is in progress.
+The lead ends its turn while children work. T3 wakes it as each one finishes. A coordinator's worker calls `t3_thread_send` on the coordinator thread as its last step, after the report file is written. That report-back wakes the coordinator. The liveness check runs while work is in progress, every 10 minutes at `every-turn` and `milestones` and every 30 minutes at `digest`. `brigade.py watch` prints `report written, no report-back` while the work is in progress, when the report was written for this attempt, and when this attempt is not marked reported. The report counts as written for this attempt when its modification time is at or after the attempt's start. A report left by a replaced worker does not count. That line is a defect. The check reads the worker's activity, finds the cause, and fires a fix at that cause.
+
+## How a coordinator reports
+
+The level is chosen when the coordinator opens. `brigade.py set --reporting` changes it later. The stored values are `every-turn`, `milestones`, and `digest`. The default is `milestones`. A `restaurant.json` with no `reporting` field reads as `milestones`.
+
+`every-turn` sends a short reply after every wake. `milestones` replies when work merges, a review sends work back or blocks it, a decision needs you, something fails or the queue pauses, or you send a message. A liveness check with nothing new, a liveness check while a review is pending, a review starting, and a worker launching are routine. At `milestones`, a routine wake ends with no reply, or with one line when the host requires text. `digest` replies only for a decision you must make, a failure or a paused queue the coordinator cannot fix itself, one summary when a batch drains, the 18:00 report, and a message from you. Every other wake ends with no reply text at all, not even a status line. That includes a worker reporting back, a review starting or finishing, a send-back, a worker launching, a merge that leaves work in progress, in review, passed review, or waiting to land, a pull request wake, a liveness check, intake with nothing new, and a schedule created, recreated, or deleted. A `digest` message is a few plain sentences for a person on what got done, what comes next, and what you must decide. It carries no work or ticket IDs, SHAs, file paths, review-round counts, or tool names. Merged pull requests may follow as a short list of linked plain titles. `brigade.py close --to-file` writes the full report, and the message names its path in one line instead of pasting it.
+
+Every level sends the 18:00 report. The 09:00 run is not a report. A message from you gets at least one line, and a direct question gets an answer. The [guide](guide.md#reporting-levels) walks through the same choice. A missing report-back is a defect. The liveness check fires a fix at its cause.
 
 ## How work lands
 
