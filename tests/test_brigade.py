@@ -2510,6 +2510,20 @@ class BrigadeTest(unittest.TestCase):
     SEAT_RULE = ("Seat rule. Copy the Mode value above into --brief-mode on every roles.py mode and roles.py show call you "
                  "make, and pass no other mode flag. Never pass --session-mode. Mode source names where your launcher's "
                  "decision came from. It does not make this thread a session.")
+    WAIT = ("- Never end your turn while a child task you started with delegate_task is still open, per step 5 of the "
+            "pstack-runtime skill's Delegation section. This overrides delegate_task's text that says to end the turn and "
+            "wait for a notification. A completion wakes you only when the child's run ends, and a stalled child or a run "
+            "left open never ends. Wait on each open child task with t3_thread_wait on its childThreadId and timeoutMs "
+            "300000, then read it with task_status. A child task is open while its workState is working or "
+            "waiting_for_children, whatever hasPendingChildRuns says. Cancel a child task with task_cancel when it runs "
+            "past its budget or stalls, per the runtime's Failure handling. A thread you launched with t3_thread_launch "
+            "has no parent, so its finished turn never wakes you. While it stays healthy, repeat t3_thread_wait on its "
+            "threadId with timeoutMs 300000 and read its activity with t3_thread_read. A timeout alone never stops it. "
+            "Stop it with t3_thread_interrupt and then a terminal t3_thread_wait only when it stalls, with no new activity "
+            "item for ten minutes per step 5 of the runtime's Delegation section, or runs past its budget. "
+            "A long-lived owner your playbook supervises, such as an Orchestrate PR owner, follows the runtime's Top-level "
+            "threads section and its playbook instead, and does not hold your report. Write the report only once every "
+            "child task and every other thread you launched is terminal.")
     CONTESTED = ("- If you find the design contested, do not run interrogate. Stop at a verifiable point, commit, and write "
                  "Contested: <one-line reason> under the status line. The coordinator moves the work to full mode and gives "
                  "your report to a fresh worker.")
@@ -2535,6 +2549,27 @@ class BrigadeTest(unittest.TestCase):
         runtime = (ROOT / "t3/runtime.md").read_text()
         self.assertIn(f"  ```text\n  {self.SEAT_RULE}\n  ```", runtime)
 
+    def test_the_runtime_still_states_the_bounded_wait(self):
+        runtime = (ROOT / "t3/runtime.md").read_text()
+        self.assertIn("does not end its turn while a child is open", runtime)
+        self.assertIn("Decide completion by `workState` alone", runtime)
+        self.assertIn("Its finished turn does not wake the launcher.", runtime)
+        self.assertIn("interrupt with `t3_thread_interrupt`", runtime)
+
+    def test_the_report_section_opens_with_the_bounded_wait(self):
+        self.coordinator()
+        text = self.brigade(*self.BRIEF)
+        lines = text.splitlines()
+        start = lines.index("REPORT:")
+        write = next(i for i in range(start + 1, len(lines)) if lines[i].startswith("- Write it to "))
+        self.assertEqual(lines[start:write + 1], ["REPORT:", self.WAIT, lines[write]])
+
+    def test_an_orchestrate_brief_carries_the_same_bounded_wait(self):
+        self.coordinator(station="orchestrate", mode="full")
+        text = self.brigade(*self.BRIEF)
+        self.assertTrue(text.startswith("Use the poteto-mode skill and its `orchestrate` playbook.\n"), text[:80])
+        self.assertEqual(text.split("REPORT:\n", 1)[1].splitlines()[0], self.WAIT)
+
     def test_a_first_light_feature_brief_prints_the_first_waivers(self):
         self.coordinator()
         text = self.brigade(*self.BRIEF)
@@ -2542,8 +2577,8 @@ class BrigadeTest(unittest.TestCase):
             "Playbook: playbooks/feature.md", "Mode: light", "Mode source: restaurant.json", "Attempt: first",
             "Waived by mode: Arena, Interrogate, Comment Sicko"))
         report = text.split("REPORT:\n", 1)[1].splitlines()
-        self.assertEqual(report[1:3], [self.REPEAT, self.CONTESTED])
-        self.assertTrue(report[3].startswith("- After that file is written, call t3_thread_send"), report[3])
+        self.assertEqual(report[2:4], [self.REPEAT, self.CONTESTED])
+        self.assertTrue(report[4].startswith("- After that file is written, call t3_thread_send"), report[4])
         self.assertEqual((self.at / "briefs/D1.md").read_text().strip(), text)
         self.assertEqual(self.mode_rows(), [])
 

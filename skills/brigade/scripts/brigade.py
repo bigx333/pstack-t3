@@ -886,6 +886,20 @@ MODE_RESOLUTIONS = 3
 SEAT_RULE = ("Seat rule. Copy the Mode value above into --brief-mode on every roles.py mode and roles.py show call you make, "
              "and pass no other mode flag. Never pass --session-mode. Mode source names where your launcher's decision came "
              "from. It does not make this thread a session.")
+WAIT_RULE = ("- Never end your turn while a child task you started with delegate_task is still open, per step 5 of the "
+             "pstack-runtime skill's Delegation section. This overrides delegate_task's text that says to end the turn and "
+             "wait for a notification. A completion wakes you only when the child's run ends, and a stalled child or a run "
+             "left open never ends. Wait on each open child task with t3_thread_wait on its childThreadId and timeoutMs "
+             "300000, then read it with task_status. A child task is open while its workState is working or "
+             "waiting_for_children, whatever hasPendingChildRuns says. Cancel a child task with task_cancel when it runs past "
+             "its budget or stalls, per the runtime's Failure handling. A thread you launched with t3_thread_launch has no "
+             "parent, so its finished turn never wakes you. While it stays healthy, repeat t3_thread_wait on its threadId with "
+             "timeoutMs 300000 and read its activity with t3_thread_read. A timeout alone never stops it. Stop it with "
+             "t3_thread_interrupt and then a terminal t3_thread_wait only when it stalls, with no new activity item for ten "
+             "minutes per step 5 of the runtime's Delegation section, or runs past its budget. A long-lived "
+             "owner your playbook supervises, such as an Orchestrate PR owner, follows the runtime's Top-level threads section "
+             "and its playbook instead, and does not hold your report. Write the report only once every child task and every "
+             "other thread you launched is terminal.")
 
 
 def holder(restaurant, dish):
@@ -1320,6 +1334,7 @@ def write_brief(restaurant, dish, mode, goal, acceptance, verify, paths, lease, 
           if dish["station"] in MEASURING_STATIONS else []),
         "", f"TIMEBOX: {dish.get('timebox') or 60} minutes. The timebox orders the work and never waives a playbook step (How, Architect, investigation, or the implementation delegate). At the limit, write the report with what remains instead of skipping steps.",
         "", "REPORT:",
+        WAIT_RULE,
         f"- Write it to {report}: status, branch, head SHA, what you ran and its output, before and after numbers with the method, deviations, follow-ups.",
         "- Under the status line, repeat this brief's Mode: line, and its Waived by mode: line when it has one. A step that line names is not a deviation.",
         *(["- If you find the design contested, do not run interrogate. Stop at a verifiable point, commit, and write Contested: <one-line reason> under the status line. The coordinator moves the work to full mode and gives your report to a fresh worker."]
