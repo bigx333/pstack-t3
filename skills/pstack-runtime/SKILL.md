@@ -53,6 +53,7 @@ A deadline or timebox sets the order of work. It never waives a step. This holds
 
    - `role` is one of `implementation`, `research`, `review`, `design`, `test`, `general`.
    - Omit `target` for an `inherit` seat.
+   - After a `t3_thread_launch` or `delegate_task` call whose seat has `options`, read the applied options from the launch result's `modelSelection.options` or from `t3_thread_configuration` on the child's `childThreadId`, and never call again with the options removed. Each applied option is one object `{"id": <key>, "value": <value>}`. A missing option or a different value is a mismatch. On a mismatch, or when the call is refused for its `options`, stop that child. Report the tool's error text. Call `task_cancel` for a child task. Call `t3_thread_interrupt` and then `t3_thread_wait` for a thread. A Cursor harness sent `options` as a string, T3 refused the call, and the child then dropped the options.
    - Use a stable `clientRequestId` so a retried call does not spawn a duplicate.
    - Retain every returned `taskId` in your todo list or work log.
 4. A child starts with only its brief. It sees none of this conversation. Put the goal, the exact paths or SHAs, how to verify, and the report shape in the brief. Point at files instead of pasting large context. Write tool steps as plain verbs ("read", "search the repo", "run"), because the child may be a different provider with different tool names. A code-writing child inside a poteto-mode playbook opens with the poteto-agent persona body. Below it, paste unchanged the lines `python3 <pstack-runtime>/scripts/roles.py mode --cwd "$PWD" --playbook <name> --attempt <kind> [--brief-mode <value> | --session-mode light]` prints, per [Modes](#modes). They start with the `Playbook: playbooks/<name>.md` line, such as `Playbook: playbooks/feature.md`, and carry the required `Mode:` line. Write no `Playbook:` line of your own, because a second one fails the check. The lines include `Attempt:`. Under `Mode: light` they also include any `Waived by mode:` line. Under `Mode: full` there is no `Waived by mode:` line, and the brief must not add one. Copy the printed `Mode:` value into `--brief-mode` on the `roles.py show` call that seats the delegate, and pass no other mode flag. Write that brief to a file and run `python3 <pstack-runtime>/scripts/roles.py check-brief <file>` before `delegate_task`. Exit 1 names what is missing. Fix the brief, run the check again, and pass the checked text unchanged. A seat that matches this thread's model, or an edit that looks small, is not a `skip:` reason for the code delegate.
@@ -298,15 +299,14 @@ Launch a new gate unless a current qualifying verdict exists at the exact head S
 - **Current.** It is the latest verdict for that SHA. A later `send-back` or `blocked` at the same SHA voids an earlier `pass`.
 - **Qualifying.** It is `pass`, and the author and verifier are of different model families.
 
-One source can show both today.
+Two sources can show both today.
 
-1. A verdict this run launched at that exact SHA. A Shipping or Autopilot root's own verdict at that SHA counts.
-
-A coordinator's pass record joins this list only in a later change that gives its store a cross-family check for one item and SHA. Until then, no other record qualifies.
+1. A coordinator's pass record, when this work is a brigade item and you know its restaurant directory and item id. Run `python3 <skills>/brigade/scripts/brigade.py --at <restaurant dir> pass check <item> --sha <head> --json`, where `<skills>` is the directory that holds `<pstack-runtime>`. Reuse the pass only when the command exits 0 and prints `"crossFamily": true`. Never read `pass.tsv` yourself. Never take the output of `pass check` without `--json` as proof, because it names the verifier and not the author.
+2. A verdict this run launched at that exact SHA. A Shipping or Autopilot root's own verdict at that SHA counts.
 
 - A verdict at another head SHA does not qualify, even when the two heads share a `git patch-id`. A patch-id ignores whitespace, so it does not prove the same behavior.
 - An Orchestrate `ledger.tsv` row does not qualify. It records verification levels and no author.
-- A verdict from another run does not qualify.
+- A Shipping or Autopilot verdict from another run does not qualify. A coordinator's pass qualifies only through source 1.
 - A `Gate:` line in a brief or a PR body is not a verdict.
 
 Full mode keeps its patch-id policy in Shipping and the Autopilot playbooks. Light mode keeps that policy for lane receipts only, such as a tests, build, or mergeability result. A lane receipt never stands in for the gate review. Read the head again right before you create the PR, mark it ready, or merge. When it moved, apply this section again.
@@ -334,10 +334,12 @@ Create top-level threads only when the user asked for separate threads or invoke
   "title": "PR owner: <slug>",
   "workspaceStrategy": {"type": "worktree", "baseRef": "main", "branch": "pstack/<slug>", "startFromOrigin": false},
   "message": "<brief>",
-  "modelSelection": {"instanceId": "claudeAgent", "model": "claude-opus-5-5"}
+  "modelSelection": {"instanceId": "claudeAgent", "model": "claude-opus-5-5", "options": {"effort": "xhigh"}}
 }
 ```
 
+- `modelSelection` is the seat with `providerInstanceId` renamed to `instanceId`, `model` copied, and `options` copied unchanged as the same object, including a boolean such as `{"fastMode": true}`. Omit `modelSelection` for an `inherit` seat.
+- Confirm a launched thread per [Delegation](#delegation) step 3.
 - For a stack, `baseRef` is the parent branch and `startFromOrigin` is false.
 - Omitted `workspaceStrategy` means the project root, not your worktree.
 - `t3_thread_launch` requires a full-access or default caller. In `approval-required` or `auto-accept-edits` it fails. Then fall back to child tasks isolated per [Isolation](#isolation), and tell the user that owners are children rather than threads.

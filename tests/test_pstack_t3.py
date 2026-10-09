@@ -1184,7 +1184,7 @@ class ModesTest(unittest.TestCase):
             "### Gate review",
             "### Announcement",
         ])
-        self.assertNotIn("pass check", self.runtime)
+        self.assertIn("pass check <item> --sha <head> --json", self.runtime)
 
     def test_deadlines_and_delegation_step_4_carry_the_mode_lines(self):
         deadlines = self.runtime.split("## Deadlines", 1)[1].split("\n## ", 1)[0]
@@ -2026,6 +2026,31 @@ class StalledChildDocTest(unittest.TestCase):
         missing = [name for name, runtime in sources.items()
                    if f"Delegation step 5]({runtime}/SKILL.md#delegation)" not in (ROOT / "t3/overrides" / name).read_text()]
         self.assertEqual(missing, [])
+
+
+class SeatLaunchDocTest(unittest.TestCase):
+    def setUp(self):
+        self.runtime = (ROOT / "skills/pstack-runtime/SKILL.md").read_text()
+
+    def test_mapping_sentence_renames_provider_instance_id_and_copies_options(self):
+        section = self.runtime.split("## Top-level threads", 1)[1].split("\n## ", 1)[0]
+        self.assertIn(
+            "`modelSelection` is the seat with `providerInstanceId` renamed to `instanceId`, "
+            "`model` copied, and `options` copied unchanged as the same object, "
+            "including a boolean such as `{\"fastMode\": true}`.",
+            section,
+        )
+        self.assertIn('"options": {"effort": "xhigh"}', section)
+        self.assertIn("Confirm a launched thread per [Delegation](#delegation) step 3.", section)
+
+    def test_readback_sentence_names_where_to_read_and_never_retries_without_options(self):
+        step = self.runtime.split("3. Spawn every independent child", 1)[1].split("\n4. A child starts", 1)[0]
+        self.assertIn(
+            "After a `t3_thread_launch` or `delegate_task` call whose seat has `options`, "
+            "read the applied options from the launch result's `modelSelection.options` or from "
+            "`t3_thread_configuration` on the child's `childThreadId`, and never call again with the options removed.",
+            step,
+        )
 
 
 if __name__ == "__main__":

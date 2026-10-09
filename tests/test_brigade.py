@@ -9,11 +9,23 @@ import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "t3/added/brigade/scripts/brigade.py"
 CODEX = "codex/gpt-6.1-sol"
 CLAUDE = "claudeAgent/claude-opus-5-5"
+HELD_QUESTION = "D1: grok could not pass the seat's options: refused. Move this coordinator to a provider that passes them?"
+HELD_LINE = (
+    "D1: open decision Q1: D1: grok could not pass the seat's options: refused. "
+    "Move this coordinator to a provider that passes them?; "
+    "launch no worker or verifier until 86 answer Q1"
+)
+STILL_OPEN = "Q1 still open; D1 stays held until 86 answer Q1 --answer moved"
+ITEM_DECISION = (
+    "brigade: an item decision's default must be one of its options, "
+    "with at least one other option that closes it"
+)
 
 
 def _wait_for_path(path, timeout=8):
@@ -185,6 +197,29 @@ def _race_child(mode, case, args):
                 _wait_for_path(case / "proceed", timeout=60)
 
         glob["Restaurant"].append = holding_append
+    elif mode == "brief-pause":
+        original_roles = glob["roles_mode"]
+
+        def paused_roles(inputs):
+            lines = original_roles(inputs)
+            if not (case / "paused").exists():
+                (case / "paused").touch()
+                _wait_for_path(case / "proceed", timeout=60)
+            return lines
+
+        glob["roles_mode"] = paused_roles
+    elif mode == "brief-churn":
+        original_roles = glob["roles_mode"]
+
+        def churning_roles(inputs):
+            lines = original_roles(inputs)
+            path = Path(args[args.index("--at") + 1]) / "restaurant.json"
+            meta = json.loads(path.read_text())
+            meta["mode"] = "full" if meta.get("mode") == "light" else "light"
+            path.write_text(json.dumps(meta))
+            return lines
+
+        glob["roles_mode"] = churning_roles
     elif mode == "append-row":
         directory, *fields = args
         restaurant = glob["Restaurant"](directory)
@@ -212,6 +247,12 @@ class BrigadeTest(unittest.TestCase):
         self.project = Path(self.temporary.name) / "Bridge Kit"
         self.project.mkdir()
         self.at = self.store / "bridge-kit" / "perf"
+        self.isolate_roles_config()
+
+    def isolate_roles_config(self):
+        patcher = mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": str(Path(self.temporary.name) / "config")})
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def tearDown(self):
         self.temporary.cleanup()
@@ -310,6 +351,54 @@ class BrigadeTest(unittest.TestCase):
         self.assertEqual(self.brigade("dish", "D1", "--state", "queued", ok=False),
                          "brigade: only reviewed work lands: D1 at abc: send-back (test asserts the bug)")
 
+    def check_json(self, sha):
+        result = subprocess.run([sys.executable, str(SCRIPT), "--store", str(self.store), "--at", str(self.at),
+                                 "pass", "check", "D1", "--sha", sha, "--json"], capture_output=True, text=True)
+        return result.returncode, result.stdout, result.stderr.strip()
+
+    def record(self, sha, verdict, *extra, author=CLAUDE, verifier=CODEX):
+        self.brigade("pass", "record", "D1", "--sha", sha, "--verdict", verdict, "--author", author, "--verifier", verifier, *extra)
+
+    def fired_bug_fix(self):
+        self.open()
+        self.brigade("ticket", "add", "--summary", "s")
+        self.brigade("fire", "--tickets", "T1", "--station", "bug-fix", "--summary", "Fix s")
+
+    def test_pass_check_json_prints_a_cross_family_pass(self):
+        self.fired_bug_fix()
+        self.record("abc", "pass")
+        code, out, err = self.check_json("abc")
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(json.loads(out), {"verdict": "pass", "author": CLAUDE, "verifier": CODEX, "note": "", "crossFamily": True})
+        self.assertIn('"crossFamily": true', out)
+        self.assertEqual(self.brigade("pass", "check", "D1", "--sha", "abc"), f"D1 at abc passed review by {CODEX}")
+
+    def test_pass_check_json_exits_1_when_a_send_back_voids_the_pass(self):
+        self.fired_bug_fix()
+        self.record("abc", "pass")
+        self.record("abc", "send-back", "--note", "test asserts the bug")
+        code, out, err = self.check_json("abc")
+        self.assertEqual((code, err), (1, "brigade: D1 at abc: send-back (test asserts the bug)"))
+        self.assertIn('"verdict": "send-back"', out)
+        self.assertEqual(json.loads(out)["note"], "test asserts the bug")
+
+    def test_pass_check_json_marks_a_same_family_pass(self):
+        self.fired_bug_fix()
+        self.record("abc", "pass", "--same-family", verifier="cursor/claude-sonnet-5-5")
+        self.record("def", "pass", "--same-family")
+        with (self.at / "pass.tsv").open("a") as table:
+            table.write(f"2026-10-08T00:00:00+00:00\tD1\t\tghi\tpass\t{CLAUDE}\tcursor/claude-sonnet-5-5\t\n")
+        for sha, note in (("abc", "same model family;"), ("def", "same model family;"), ("ghi", "")):
+            code, out, err = self.check_json(sha)
+            self.assertEqual((code, err), (0, ""))
+            self.assertIn('"crossFamily": false', out)
+            self.assertEqual(json.loads(out)["note"], note)
+
+    def test_pass_check_json_at_another_sha_has_no_verdict(self):
+        self.fired_bug_fix()
+        self.record("abc", "pass")
+        self.assertEqual(self.check_json("def"), (1, "", "brigade: D1 has no review verdict for def"))
+
     def test_report_lists_only_what_changed_since_the_last_report(self):
         self.open()
         self.brigade("ticket", "add", "--summary", "Startup is slow")
@@ -373,7 +462,7 @@ class BrigadeTest(unittest.TestCase):
         env = os.environ | {"COLUMNS": "200"}
         result = subprocess.run([sys.executable, str(SCRIPT), "--help"], capture_output=True, text=True, env=env)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("status              the thread line first, then counts, then reports to and owner when present", result.stdout)
+        self.assertIn("status              the thread line first, then counts, then reports to, mode, and owner when present", result.stdout)
         self.assertNotIn("one line of counts", result.stdout)
 
     def test_status_and_walk_speak_plain_engineering_prose(self):
@@ -1733,6 +1822,36 @@ class BrigadeTest(unittest.TestCase):
         self.assertEqual(self.brigade("fire", "--tickets", "T1", "--station", "bug-fix", "--summary", "s", "--paths", paths),
                          "D1 (lease L1 held by perf/D1)")
 
+    def backdate_attempt(self, minutes, ident="D1"):
+        start = (datetime.now(timezone.utc) - timedelta(minutes=minutes)).isoformat()
+        log = self.at / "log.tsv"
+        lines = log.read_text().splitlines()
+        rewritten = [lines[0]]
+        found = False
+        for line in lines[1:]:
+            fields = line.split("\t")
+            if fields[1:4] == ["dish", ident, "in-progress"]:
+                fields[0] = start
+                line = "\t".join(fields)
+                found = True
+            rewritten.append(line)
+        self.assertTrue(found, ident)
+        log.write_text("\n".join(rewritten) + "\n")
+
+    def park_item(self, question=HELD_QUESTION, dish="D1"):
+        dish_args = ("--dish", dish) if dish else ()
+        return self.brigade("86", "add", *dish_args, "--question", question,
+                            "--options", "moved, keep parked", "--default", "keep parked")
+
+    def store_bytes(self):
+        return tuple((self.at / name).read_bytes() for name in ("86.tsv", "log.tsv", "restaurant.json"))
+
+    def open_admin(self):
+        return self.run_at(self.store / "bridge-kit" / ".admin", "open", "--admin", "--project-root", str(self.project))
+
+    def admin(self, *args, ok=True):
+        return self.run_at(self.store / "bridge-kit" / ".admin", *args, ok=ok)
+
     def landing_db(self):
         import sqlite3
         database = next((Path(self.temporary.name) / "state").glob("pstack-t3/landing/*/land.db"))
@@ -1832,6 +1951,247 @@ class BrigadeTest(unittest.TestCase):
             self.assertEqual(self.brigade("watch"), line)
             self.assertGreater(self.lease_row(1)["expires"],
                                (datetime.now(timezone.utc) + timedelta(hours=5.9)).isoformat(), line)
+
+    def test_an_open_item_decision_replaces_an_over_timebox_line_and_renews_the_lease(self):
+        self.started()
+        self.brigade("dish", "D1", "--timebox", "30")
+        self.backdate_attempt(45)
+        self.land("lease", "renew", "L1", "--ttl-hours", "0.01")
+        self.assertLess(self.lease_row(1)["expires"], (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat())
+        self.assertEqual(self.park_item(), "Q1")
+        before = json.loads((self.at / "restaurant.json").read_text())["lastActivityAt"]
+        self.assertEqual(self.brigade("watch"), HELD_LINE)
+        self.assertGreater(self.lease_row(1)["expires"],
+                           (datetime.now(timezone.utc) + timedelta(hours=5.9)).isoformat())
+        self.assertGreater(json.loads((self.at / "restaurant.json").read_text())["lastActivityAt"], before)
+
+    def test_an_open_item_decision_replaces_the_no_worker_line(self):
+        self.started()
+        self.assertEqual(self.park_item(), "Q1")
+        self.brigade("dish", "D1", "--state", "sent-back")
+        self.brigade("dish", "D1", "--state", "in-progress")
+        self.assertEqual(self.brigade("watch"), HELD_LINE)
+
+    def test_an_open_item_decision_replaces_the_in_review_line(self):
+        self.started()
+        self.assertEqual(self.park_item(), "Q1")
+        self.brigade("dish", "D1", "--state", "in-review", "--sha", "abc1234")
+        self.assertEqual(self.brigade("watch"), HELD_LINE)
+
+    def test_an_expired_lease_under_a_held_item_follows_the_decision_line(self):
+        self.started()
+        self.assertEqual(self.park_item(), "Q1")
+        self.land("lease", "renew", "L1", "--ttl-hours", "0")
+        self.assertEqual(self.brigade("watch").splitlines(), [
+            HELD_LINE,
+            "D1: lease L1 expired; stop its worker, then run lease renew L1",
+        ])
+
+    def test_answering_an_item_decision_restores_the_over_timebox_line(self):
+        self.started()
+        self.brigade("dish", "D1", "--timebox", "30")
+        self.backdate_attempt(45)
+        self.park_item()
+        self.assertEqual(self.brigade("watch"), HELD_LINE)
+        self.assertEqual(self.brigade("86", "answer", "Q1", "--answer", "moved"), "Q1 answered")
+        self.assertRegex(
+            self.brigade("watch"),
+            r"^D1: over its 30m timebox at \d+m with no report; read its thread and decide \(no worker recorded\)$",
+        )
+
+    def test_answering_an_item_decision_restores_the_no_worker_line(self):
+        self.started()
+        self.park_item()
+        self.brigade("dish", "D1", "--state", "sent-back")
+        self.brigade("dish", "D1", "--state", "in-progress")
+        self.assertEqual(self.brigade("watch"), HELD_LINE)
+        self.assertEqual(self.brigade("86", "answer", "Q1", "--answer", "moved"), "Q1 answered")
+        self.assertEqual(self.brigade("watch"), "D1: in progress with no worker thread; launch a fresh worker")
+
+    def test_answering_an_item_decision_restores_the_in_review_line(self):
+        self.started()
+        self.park_item()
+        self.brigade("dish", "D1", "--state", "in-review", "--sha", "abc1234")
+        self.assertEqual(self.brigade("watch"), HELD_LINE)
+        self.assertEqual(self.brigade("86", "answer", "Q1", "--answer", "moved"), "Q1 answered")
+        self.assertEqual(self.brigade("watch"), "D1: in review")
+
+    def test_86_list_names_the_item_and_keeps_a_blank_dish_in_the_old_format(self):
+        self.started()
+        self.assertEqual(self.park_item(), "Q1")
+        self.assertEqual(self.brigade("86", "add", "--question", "Ship it?", "--options", "yes, no", "--default", "no"), "Q2")
+        self.assertEqual(self.brigade("86", "list"), "\n".join([
+            f"Q1 for D1: {HELD_QUESTION} Options: moved, keep parked. Default: keep parked.",
+            "Q2: Ship it? Options: yes, no. Default: no.",
+        ]))
+
+    def test_a_blank_dish_decision_does_not_hold_the_item(self):
+        self.started()
+        self.brigade("dish", "D1", "--state", "in-review", "--sha", "abc1234")
+        self.assertEqual(self.brigade("86", "add", "--question", "Ship it?", "--options", "yes, no", "--default", "no"), "Q1")
+        self.assertEqual(self.brigade("86", "list"), "Q1: Ship it? Options: yes, no. Default: no.")
+        self.assertEqual(self.brigade("watch"), "D1: in review")
+
+    def test_a_second_86_add_for_a_held_item_prints_the_open_id_and_appends_nothing(self):
+        self.started()
+        self.assertEqual(self.park_item(), "Q1")
+        table = (self.at / "86.tsv").read_text()
+        decisions = [row for row in self.log_rows() if row["kind"] == "decision"]
+        self.assertEqual(len(decisions), 1)
+        self.assertEqual(len([line for line in table.splitlines() if line]) - 1, 1)
+        other = "D1: cursor could not pass the seat's options: refused again. Move this coordinator to a provider that passes them?"
+        self.assertEqual(self.park_item(other), "Q1")
+        self.assertEqual((self.at / "86.tsv").read_text(), table)
+        self.assertEqual([row for row in self.log_rows() if row["kind"] == "decision"], decisions)
+        self.assertEqual(self.brigade("watch"), HELD_LINE)
+        self.assertEqual(self.brigade("watch"), HELD_LINE)
+
+    def test_keep_parked_leaves_the_item_decision_open_and_writes_nothing(self):
+        self.started()
+        self.assertEqual(self.park_item(), "Q1")
+        before = self.store_bytes()
+        self.assertEqual(self.brigade("86", "answer", "Q1", "--answer", "keep parked"), STILL_OPEN)
+        self.assertEqual(self.store_bytes(), before)
+        self.assertEqual(self.brigade("watch"), HELD_LINE)
+
+    def test_a_relayed_keep_parked_leaves_the_item_held(self):
+        self.started()
+        self.assertEqual(self.park_item(), "Q1")
+        self.open_admin()
+        before = (self.at / "86.tsv").read_bytes()
+        self.admin("request", "--to", "perf", "answer perf Q1: keep parked")
+        self.assertEqual(self.brigade("inbox", "take"), "A1: answer perf Q1: keep parked")
+        self.assertEqual(self.brigade("86", "answer", "Q1", "--answer", "keep parked"), STILL_OPEN)
+        self.assertEqual(self.brigade("inbox", "done", "A1"), "A1 done")
+        self.assertEqual(self.brigade("watch"), HELD_LINE)
+        self.assertEqual((self.at / "86.tsv").read_bytes(), before)
+
+    def test_a_replayed_keep_parked_relay_logs_inbox_done_once(self):
+        self.started()
+        self.assertEqual(self.park_item(), "Q1")
+        self.open_admin()
+        before = (self.at / "86.tsv").read_bytes()
+        self.admin("request", "--to", "perf", "answer perf Q1: keep parked")
+        self.assertEqual(self.brigade("inbox", "take"), "A1: answer perf Q1: keep parked")
+        self.assertEqual(self.brigade("86", "answer", "Q1", "--answer", "keep parked"), STILL_OPEN)
+        self.assertEqual(self.brigade("inbox", "take"), "A1: answer perf Q1: keep parked")
+        self.assertEqual(self.brigade("86", "answer", "Q1", "--answer", "keep parked"), STILL_OPEN)
+        self.assertEqual(self.brigade("inbox", "done", "A1"), "A1 done")
+        self.assertEqual(self.brigade("inbox", "take"), "nothing handed to you")
+        self.assertEqual(self.brigade("inbox", "done", "A1"), "A1 done")
+        self.assertEqual((self.at / "86.tsv").read_bytes(), before)
+        done = [row for row in self.log_rows() if row["kind"] == "inbox-done"]
+        self.assertEqual([(row["id"], row["state"], row["note"]) for row in done],
+                         [("A1", "done", "answer perf Q1: keep parked")])
+
+    def test_moved_closes_an_item_decision_and_a_later_answer_writes_nothing(self):
+        self.started()
+        ordinary = self.brigade("watch")
+        self.assertEqual(ordinary, "D1: running 0m of 60m (no worker recorded)")
+        self.park_item()
+        opened = [row for row in self.log_rows() if row["kind"] == "decision"]
+        self.assertEqual(self.brigade("86", "answer", "Q1", "--answer", "Moved."), "Q1 answered")
+        row = self.table_row(self.at, "86.tsv", "Q1")
+        self.assertEqual((row["state"], row["answer"]), ("answered", "moved"))
+        answered = [row for row in self.log_rows() if row["kind"] == "decision" and row["state"] == "answered"]
+        self.assertEqual(len(answered), 1)
+        self.assertEqual(len([row for row in self.log_rows() if row["kind"] == "decision"]), len(opened) + 1)
+        self.assertEqual(self.brigade("watch"), ordinary)
+        before = self.store_bytes()
+        self.assertEqual(self.brigade("86", "answer", "Q1", "--answer", "keep parked"), "Q1 answered")
+        self.assertEqual(self.store_bytes(), before)
+
+    def test_a_second_refusal_after_keep_parked_prints_the_open_id(self):
+        self.started()
+        self.assertEqual(self.park_item(), "Q1")
+        self.assertEqual(self.brigade("86", "answer", "Q1", "--answer", "keep parked"), STILL_OPEN)
+        table = (self.at / "86.tsv").read_text()
+        decisions = [row for row in self.log_rows() if row["kind"] == "decision"]
+        other = "D1: cursor could not pass the seat's options: refused again. Move this coordinator to a provider that passes them?"
+        self.assertEqual(self.park_item(other), "Q1")
+        self.assertEqual((self.at / "86.tsv").read_text(), table)
+        self.assertEqual([row for row in self.log_rows() if row["kind"] == "decision"], decisions)
+
+    def test_free_text_keeps_the_hold_and_writes_nothing(self):
+        self.started()
+        self.assertEqual(self.park_item(), "Q1")
+        before = self.store_bytes()
+        self.assertEqual(self.brigade("86", "answer", "Q1", "--answer", "I moved it"), STILL_OPEN)
+        self.assertEqual(self.store_bytes(), before)
+        self.assertEqual(self.brigade("watch"), HELD_LINE)
+
+    def test_an_item_decision_needs_a_default_and_a_closing_option(self):
+        self.started()
+        self.assertEqual(self.brigade("86", "add", "--dish", "D1", "--question", "Move?",
+                                      "--options", "keep parked", "--default", "keep parked", ok=False), ITEM_DECISION)
+        self.assertEqual(self.brigade("86", "add", "--dish", "D1", "--question", "Move?",
+                                      "--options", "moved, keep parked", "--default", "ship it", ok=False), ITEM_DECISION)
+        self.assertEqual((self.at / "86.tsv").read_text().splitlines(),
+                         ["id\tat\tstate\tdish\tquestion\toptions\tdefault\tanswer"])
+        self.assertEqual(self.park_item(), "Q1")
+        table = (self.at / "86.tsv").read_text()
+        self.assertEqual(self.brigade("86", "add", "--dish", "D1", "--question", "Move?",
+                                      "--options", "keep parked", "--default", "keep parked"), "Q1")
+        self.assertEqual(self.brigade("86", "add", "--dish", "D1", "--question", "Move?",
+                                      "--options", "moved, keep parked", "--default", "ship it"), "Q1")
+        self.assertEqual((self.at / "86.tsv").read_text(), table)
+
+    def test_an_item_decision_whose_options_collapse_to_the_default_once_stored_is_refused(self):
+        self.started()
+        before = tuple((self.at / name).read_bytes() for name in ("86.tsv", "log.tsv"))
+        for options in ("keep parked, keep\nparked", "keep parked, keep\tparked", "keep parked, keep\r\nparked"):
+            self.assertEqual(self.brigade("86", "add", "--dish", "D1", "--question", "Move?",
+                                          "--options", options, "--default", "keep parked", ok=False),
+                             ITEM_DECISION, repr(options))
+            self.assertEqual(tuple((self.at / name).read_bytes() for name in ("86.tsv", "log.tsv")), before,
+                             repr(options))
+
+    def test_an_item_decision_stores_its_options_cleaned_and_closes_only_on_the_other_option(self):
+        self.started()
+        self.assertEqual(self.brigade("86", "add", "--dish", "D1", "--question", "Move\tthis?",
+                                      "--options", "moved\r\nelsewhere, keep\nparked",
+                                      "--default", "keep\tparked"), "Q1")
+        row = self.table_row(self.at, "86.tsv", "Q1")
+        self.assertEqual((row["question"], row["options"], row["default"]),
+                         ("Move this?", "moved elsewhere, keep parked", "keep parked"))
+        before = self.store_bytes()
+        self.assertEqual(self.brigade("86", "answer", "Q1", "--answer", "keep parked"),
+                         "Q1 still open; D1 stays held until 86 answer Q1 --answer 'moved elsewhere'")
+        self.assertEqual(self.store_bytes(), before)
+        self.assertEqual(self.brigade("86", "answer", "Q1", "--answer", "Moved elsewhere."), "Q1 answered")
+        row = self.table_row(self.at, "86.tsv", "Q1")
+        self.assertEqual((row["state"], row["answer"]), ("answered", "moved elsewhere"))
+
+    def test_a_blank_dish_decision_still_closes_on_any_text(self):
+        self.started()
+        self.brigade("dish", "D1", "--state", "in-review", "--sha", "abc1234")
+        self.assertEqual(self.brigade("86", "add", "--question", "Ship it?",
+                                      "--options", "keep parked", "--default", "keep parked"), "Q1")
+        self.assertEqual(self.brigade("86", "answer", "Q1", "--answer", "keep parked"), "Q1 answered")
+        row = self.table_row(self.at, "86.tsv", "Q1")
+        self.assertEqual((row["state"], row["answer"]), ("answered", "keep parked"))
+        self.assertEqual(self.brigade("86", "add", "--question", "Really?",
+                                      "--options", "yes", "--default", "no"), "Q2")
+        self.assertEqual(self.brigade("86", "answer", "Q2", "--answer", "whatever"), "Q2 answered")
+        self.assertEqual(self.table_row(self.at, "86.tsv", "Q2")["answer"], "whatever")
+        self.assertEqual(self.brigade("watch"), "D1: in review")
+
+    def test_a_legacy_item_row_with_no_closing_option_closes_on_any_answer(self):
+        self.started()
+        ordinary = self.brigade("watch")
+        question = "Hold this item?"
+        path = self.at / "86.tsv"
+        header = path.read_text().splitlines()[0]
+        row = "\t".join(["Q1", "2026-10-06T00:00:00+00:00", "open", "D1", question, "keep parked", "keep parked", ""])
+        path.write_text(header + "\n" + row + "\n")
+        self.assertEqual(
+            self.brigade("watch"),
+            f"D1: open decision Q1: {question}; launch no worker or verifier until 86 answer Q1",
+        )
+        self.assertEqual(self.brigade("86", "answer", "Q1", "--answer", "keep parked"), "Q1 answered")
+        stored = self.table_row(self.at, "86.tsv", "Q1")
+        self.assertEqual((stored["state"], stored["answer"]), ("answered", "keep parked"))
+        self.assertEqual(self.brigade("watch"), ordinary)
 
     def test_a_passed_item_with_a_submitted_entry_says_mark_it_queued(self):
         self.started()
@@ -2028,6 +2388,325 @@ class BrigadeTest(unittest.TestCase):
         self.assertEqual(self.brigade("ticket", "add", "--summary", "unowned", ok=False, owner=False),
                          "brigade: this store is owned by t1@1; pass --owner <thread>@<generation> from status")
         self.assertEqual(self.brigade("--owner", "t1@1", "ticket", "add", "--summary", "owned"), "T2")
+
+
+    def mode_rows(self):
+        return [line.split("\t")[1:] for line in (self.at / "log.tsv").read_text().splitlines()[1:]
+                if line.split("\t")[1] == "mode"]
+
+    def test_open_mode_records_light_and_set_mode_clears_it(self):
+        self.assertEqual(self.brigade("open", "--project-root", str(self.project), "--name", "Perf", "--mode", "light"),
+                         f"opened {self.at}")
+        self.assertEqual(json.loads((self.at / "restaurant.json").read_text())["mode"], "light")
+        self.assertIn("## Budget\n\nAny cap on parallel workers, and whether a provider's usage limit switches this restaurant "
+                      "to light mode.\n", (self.at / "menu.md").read_text())
+        self.brigade("set", "--thread", "c1")
+        self.assertEqual(self.brigade("status"),
+                         "thread c1\nreporting: milestones, no landing contract\nmode light\nowner c1@1")
+        self.assertIn("  Perf (reports milestones, mode light): nothing on record", self.brigade("walk"))
+        self.assertEqual(self.brigade("open", "--project-root", str(self.project), "--name", "Perf", "--mode", "full"),
+                         f"exists {self.at}\nthread c1 already recorded\nmode stays light; change it with set --mode")
+        self.assertEqual(json.loads(self.brigade("set", "--mode", "full"))["mode"], "full")
+        self.assertEqual(self.brigade("set", "--mode", "fast", ok=False), 'brigade: --mode takes full, light, or ""')
+        self.assertNotIn("mode", json.loads(self.brigade("set", "--mode", "")))
+        self.assertEqual(self.brigade("status"), "thread c1\nreporting: milestones, no landing contract\nowner c1@1")
+        self.assertIn("  Perf (reports milestones): nothing on record", self.brigade("walk"))
+        self.assertEqual(self.brigade("open", "--project-root", str(self.project), "--name", "Perf", "--mode", "full"),
+                         f"exists {self.at}\nthread c1 already recorded\nmode stays unset; change it with set --mode")
+
+    def test_item_mode_flags_refuse_light_and_a_missing_reason_with_exit_1(self):
+        self.fired_bug_fix()
+        self.brigade("ticket", "add", "--summary", "t")
+        before = (self.at / "log.tsv").read_bytes()
+        refusals = [
+            (("dish", "D1", "--mode", "light", "--reason", "r"),
+             "brigade: an item's mode only moves to full; change the coordinator with set --mode light"),
+            (("fire", "--tickets", "T2", "--station", "bug-fix", "--summary", "t", "--mode", "light", "--reason", "r"),
+             "brigade: an item's mode only moves to full; change the coordinator with set --mode light"),
+            (("dish", "D1", "--mode", "full"), 'brigade: --mode full needs --reason "<one line>"'),
+            (("dish", "D1", "--mode", "full", "--reason", " "), 'brigade: --mode full needs --reason "<one line>"'),
+            (("dish", "D1", "--reason", "r"), "brigade: --reason goes with --mode full"),
+            (("dish", "D1", "--mode", "fast", "--reason", "r"), "brigade: --mode takes full, got 'fast'"),
+            (("dish", "D1", "--mode", "full", "--reason", "r", "--state", "dropped"),
+             "brigade: --mode full needs open work; run --state dropped without it"),
+            (("dish", "D1", "--mode", "full", "--reason", "r", "--state", "queued"),
+             "brigade: --mode full needs open work; run --state queued without it"),
+        ]
+        for args, message in refusals:
+            result = subprocess.run([sys.executable, str(SCRIPT), "--store", str(self.store), "--at", str(self.at), *args],
+                                    capture_output=True, text=True)
+            self.assertEqual((result.returncode, result.stderr.strip()), (1, message), args)
+        self.assertEqual((self.at / "log.tsv").read_bytes(), before)
+        self.assertEqual(self.brigade("ticket", "list", "--state", "waiting"), "T2 waiting [user] t")
+
+    def test_dish_mode_full_twice_keeps_the_first_reason(self):
+        self.fired_bug_fix()
+        self.assertEqual(self.brigade("dish", "D1", "--mode", "full", "--reason", "contested: x"),
+                         "D1 in-progress, mode full: contested: x")
+        self.assertEqual(self.brigade("dish", "D1", "--mode", "full", "--reason", "y"),
+                         "D1 in-progress, mode full: contested: x")
+        self.assertEqual([row[:4] for row in self.mode_rows()], [["mode", "D1", "full", "contested: x"]])
+        self.assertEqual(self.brigade("dish", "D1", "--state", "blocked", "--mode", "full", "--reason", "y"),
+                         "D1 blocked, mode full: contested: x")
+        self.record("abc", "pass")
+        self.brigade("dish", "D1", "--state", "queued")
+        self.assertEqual(self.brigade("dish", "D1", "--mode", "full", "--reason", "z", ok=False),
+                         "brigade: D1 is queued; only open work moves to full mode")
+        self.brigade("dish", "D1", "--state", "merged")
+        self.assertEqual(self.brigade("dish", "D1", "--mode", "full", "--reason", "z", ok=False),
+                         "brigade: D1 is merged; only open work moves to full mode")
+        self.assertEqual(len(self.mode_rows()), 1)
+
+    def test_dish_mode_full_with_a_stale_owner_appends_nothing(self):
+        self.fired_bug_fix()
+        self.brigade("set", "--thread", "c1")
+        self.brigade("set", "--thread", "c2", "--replace")
+        stale = "brigade: owner c1@1 is stale; this store is owned by c2@2"
+        before = (self.at / "log.tsv").read_bytes()
+        self.assertEqual(self.brigade("--owner", "c1@1", "dish", "D1", "--mode", "full", "--reason", "r", ok=False), stale)
+        self.assertEqual((self.at / "log.tsv").read_bytes(), before)
+        self.brigade("dish", "D1", "--mode", "full", "--reason", "r")
+        after = (self.at / "log.tsv").read_bytes()
+        self.assertEqual(self.brigade("--owner", "c1@1", "dish", "D1", "--mode", "full", "--reason", "r", ok=False), stale)
+        self.assertEqual((self.at / "log.tsv").read_bytes(), after)
+        self.record("abc", "pass")
+        self.brigade("dish", "D1", "--state", "merged")
+        self.assertEqual(self.brigade("--owner", "c1@1", "dish", "D1", "--mode", "full", "--reason", "r", ok=False), stale)
+
+    def test_fire_mode_full_records_the_escalation_after_the_dish_row(self):
+        self.open()
+        self.brigade("ticket", "add", "--summary", "lock order")
+        self.assertEqual(self.brigade("fire", "--tickets", "T1", "--station", "bug-fix", "--summary", "Fix the lock order",
+                                      "--mode", "full", "--reason", "tickets name a lock"), "D1")
+        rows = [line.split("\t")[1:4] for line in (self.at / "log.tsv").read_text().splitlines()[1:]]
+        self.assertEqual(rows[-3:], [["dish", "D1", "in-progress"], ["mode", "D1", "full"], ["ticket", "T1", "assigned"]])
+        self.assertEqual(self.mode_rows()[0][3], "tickets name a lock")
+
+    def test_a_refused_fire_mode_full_keeps_the_reason_in_the_unblocked_command(self):
+        self.open()
+        self.brigade("set", "--workers", "1")
+        self.brigade("ticket", "add", "--summary", "one")
+        self.brigade("ticket", "add", "--summary", "two")
+        self.brigade("fire", "--tickets", "T1", "--station", "bug-fix", "--summary", "a")
+        self.assertIn("nothing fired: 1 of 1 workers running",
+                      self.brigade("fire", "--tickets", "T2", "--station", "bug-fix", "--summary", "Fix the lock order",
+                                   "--mode", "full", "--reason", "tickets name a lock", ok=False))
+        self.brigade("dish", "D1", "--state", "blocked")
+        line = next(line for line in self.brigade("watch").splitlines() if line.startswith("T2:"))
+        self.assertEqual(line, "T2: unblocked; run fire --tickets=T2 --station=bug-fix '--summary=Fix the lock order' "
+                               "--timebox=60 --mode=full '--reason=tickets name a lock'")
+        result = self.bash_unblocked(self.at, line)
+        self.assertEqual((result.returncode, result.stdout.strip()), (0, "D2"), result.stderr)
+        self.assertEqual([row[:4] for row in self.mode_rows()], [["mode", "D2", "full", "tickets name a lock"]])
+
+    def test_close_lists_an_escalation_with_its_tickets(self):
+        self.fired_bug_fix()
+        self.brigade("close")
+        self.brigade("dish", "D1", "--mode", "full", "--reason", "contested: two owners")
+        text = self.brigade("close", "--dry-run")
+        self.assertEqual(text.split("\n\n", 2)[2], "## Moved to full mode\n\n- D1 (T1): contested: two owners")
+
+
+    SEAT_RULE = ("Seat rule. Copy the Mode value above into --brief-mode on every roles.py mode and roles.py show call you "
+                 "make, and pass no other mode flag. Never pass --session-mode. Mode source names where your launcher's "
+                 "decision came from. It does not make this thread a session.")
+    CONTESTED = ("- If you find the design contested, do not run interrogate. Stop at a verifiable point, commit, and write "
+                 "Contested: <one-line reason> under the status line. The coordinator moves the work to full mode and gives "
+                 "your report to a fresh worker.")
+    REPEAT = ("- Under the status line, repeat this brief's Mode: line, and its Waived by mode: line when it has one. "
+              "A step that line names is not a deviation.")
+    BRIEF = ("brief", "D1", "--goal", "g", "--acceptance", "a", "--verify", "v", "--paths", "src/a.py", "--lease", "L1",
+             "--base", "origin/main")
+
+    def coordinator(self, station="feature", mode="light", *fire):
+        self.open()
+        (self.at / "menu.md").write_text("## Purpose\n\nFast.\n")
+        self.brigade("set", "--thread", "c1")
+        if mode:
+            self.brigade("set", "--mode", mode)
+        self.brigade("ticket", "add", "--summary", "one")
+        self.brigade("fire", "--tickets", "T1", "--station", station, "--summary", "s", "--branch", "perf/d1",
+                     "--thread", "w1", *fire)
+
+    def head(self, *lines, station="feature"):
+        return "\n".join([f"Use the poteto-mode skill and its `{station}` playbook.", *lines, "Gate: brigade", self.SEAT_RULE])
+
+    def test_the_brief_pastes_the_runtime_seat_rule_unchanged(self):
+        runtime = (ROOT / "t3/runtime.md").read_text()
+        self.assertIn(f"  ```text\n  {self.SEAT_RULE}\n  ```", runtime)
+
+    def test_a_first_light_feature_brief_prints_the_first_waivers(self):
+        self.coordinator()
+        text = self.brigade(*self.BRIEF)
+        self.assertEqual(text.split("\n\n", 1)[0], self.head(
+            "Playbook: playbooks/feature.md", "Mode: light", "Mode source: restaurant.json", "Attempt: first",
+            "Waived by mode: Arena, Interrogate, Comment Sicko"))
+        report = text.split("REPORT:\n", 1)[1].splitlines()
+        self.assertEqual(report[1:3], [self.REPEAT, self.CONTESTED])
+        self.assertTrue(report[3].startswith("- After that file is written, call t3_thread_send"), report[3])
+        self.assertEqual((self.at / "briefs/D1.md").read_text().strip(), text)
+        self.assertEqual(self.mode_rows(), [])
+
+    def test_a_brief_without_a_mode_prints_the_default(self):
+        self.coordinator(mode=None)
+        text = self.brigade(*self.BRIEF)
+        self.assertEqual(text.split("\n\n", 1)[0], self.head(
+            "Playbook: playbooks/feature.md", "Mode: full", "Mode source: default", "Attempt: first"))
+        self.assertIn(self.REPEAT, text)
+        self.assertNotIn("Contested:", text)
+
+    def test_one_send_back_briefs_a_fix_attempt(self):
+        self.coordinator()
+        self.record("a1", "send-back")
+        text = self.brigade(*self.BRIEF)
+        self.assertEqual(text.split("\n\n", 1)[0], self.head(
+            "Playbook: playbooks/feature.md", "Mode: light", "Mode source: restaurant.json", "Attempt: fix",
+            "Waived by mode: How, Architect, Arena, Interrogate, Comment Sicko"))
+
+    def test_a_replaced_worker_keeps_the_attempt_and_adds_no_send_back(self):
+        self.coordinator()
+        self.brigade("dish", "D1", "--thread", "w2")
+        self.brigade("dish", "D1", "--thread", "w3")
+        self.assertIn("Mode: light\nMode source: restaurant.json\nAttempt: first\n", self.brigade(*self.BRIEF))
+        self.record("a1", "send-back")
+        self.brigade("dish", "D1", "--state", "in-progress")
+        self.brigade("dish", "D1", "--thread", "w4")
+        self.brigade("dish", "D1", "--thread", "w5")
+        self.assertIn("Mode: light\nMode source: restaurant.json\nAttempt: fix\n", self.brigade(*self.BRIEF))
+        self.assertEqual(self.mode_rows(), [])
+
+    def test_a_queue_bounce_briefs_a_bounce_attempt(self):
+        self.coordinator(station="bug-fix")
+        self.record("a1", "pass")
+        self.brigade("dish", "D1", "--state", "queued")
+        self.brigade("dish", "D1", "--state", "in-progress")
+        self.assertEqual(self.brigade(*self.BRIEF).split("\n\n", 1)[0], self.head(
+            "Playbook: playbooks/bug-fix.md", "Mode: light", "Mode source: restaurant.json", "Attempt: bounce",
+            "Waived by mode: How, Why, Architect, Comment Sicko", station="bug-fix"))
+
+    def test_the_second_send_back_moves_the_item_to_full_once(self):
+        self.coordinator()
+        self.record("a1", "send-back")
+        self.brigade("dish", "D1", "--state", "in-progress")
+        self.record("a2", "send-back")
+        escalated = self.head("Playbook: playbooks/feature.md", "Mode: full", "Mode source: escalated: second send-back",
+                              "Attempt: fix")
+        text = self.brigade(*self.BRIEF)
+        self.assertEqual(text.split("\n\n", 1)[0], escalated)
+        self.assertNotIn("Contested:", text)
+        self.assertEqual([row[:4] for row in self.mode_rows()], [["mode", "D1", "full", "second send-back"]])
+        self.brigade(*self.BRIEF)
+        self.assertEqual(len(self.mode_rows()), 1)
+        self.brigade("set", "--mode", "light")
+        self.assertEqual(self.brigade(*self.BRIEF).split("\n\n", 1)[0], escalated)
+        self.assertEqual(self.brigade("close", "--dry-run").split("## Moved to full mode\n\n", 1)[1].split("\n")[0],
+                         "- D1 (T1): second send-back")
+
+    def test_the_escalation_lives_in_the_log_and_a_stale_write_changes_no_row(self):
+        self.coordinator()
+        self.record("a1", "send-back")
+        self.brigade("dish", "D1", "--state", "in-progress")
+        self.record("a2", "send-back")
+        self.brigade(*self.BRIEF)
+        (self.at / "pass.tsv").write_text("\t".join(("at", "dish", "pr", "sha", "verdict", "author", "verifier", "note")) + "\n")
+        self.brigade("set", "--mode", "light")
+        self.assertIn("Mode: full\nMode source: escalated: second send-back\n", self.brigade(*self.BRIEF))
+        self.brigade("set", "--thread", "c2", "--replace")
+        before = (self.at / "log.tsv").read_bytes()
+        self.assertEqual(self.brigade("--owner", "c1@1", "dish", "D1", "--mode", "full", "--reason", "late", ok=False),
+                         "brigade: owner c1@1 is stale; this store is owned by c2@2")
+        self.assertEqual(self.brigade("--owner", "c1@1", *self.BRIEF, ok=False),
+                         "brigade: owner c1@1 is stale; this store is owned by c2@2")
+        self.assertEqual((self.at / "log.tsv").read_bytes(), before)
+
+    def test_set_mode_leaves_a_written_brief_unchanged(self):
+        self.coordinator(mode="full")
+        self.brigade(*self.BRIEF)
+        written = (self.at / "briefs/D1.md").read_bytes()
+        self.brigade("set", "--mode", "light")
+        self.assertEqual((self.at / "briefs/D1.md").read_bytes(), written)
+        self.assertIn("Mode: light\n", self.brigade(*self.BRIEF))
+
+    def test_fire_mode_full_carries_its_reason_into_every_brief(self):
+        self.coordinator("bug-fix", "light", "--mode", "full", "--reason", "tickets name a lock")
+        self.assertIn("Mode: full\nMode source: escalated: tickets name a lock\nAttempt: first\nGate: brigade\n",
+                      self.brigade(*self.BRIEF))
+        self.assertEqual(len(self.mode_rows()), 1)
+
+    def test_a_lease_over_a_configured_path_escalates_once(self):
+        self.git_project()
+        (self.project / ".pstack").mkdir()
+        (self.project / ".pstack/t3-roles.json").write_text(json.dumps({"escalate": ["src/lock.py"]}))
+        self.coordinator()
+        brief = [*self.BRIEF]
+        brief[brief.index("src/a.py")] = "src/lock.py"
+        self.assertIn("Mode: full\nMode source: escalated: lease covers src/lock.py\n", self.brigade(*brief))
+        self.assertIn("Mode: full\nMode source: escalated: lease covers src/lock.py\n", self.brigade(*self.BRIEF))
+        self.assertEqual([row[:4] for row in self.mode_rows()], [["mode", "D1", "full", "lease covers src/lock.py"]])
+
+    def test_a_station_that_is_not_a_playbook_briefs_only_the_mode(self):
+        self.coordinator(station="correct")
+        text = self.brigade(*self.BRIEF)
+        self.assertEqual(text.split("\n\n", 1)[0], self.head("Mode: light", "Mode source: restaurant.json", station="correct"))
+
+    def test_roles_mode_refuses_to_run_under_a_store_lock(self):
+        glob = runpy.run_path(str(SCRIPT))["run"].__globals__
+        glob["HELD_LOCKS"].append(Path("/store/held"))
+        with self.assertRaises(glob["BrigadeError"]) as caught:
+            glob["roles_mode"](None)
+        self.assertEqual(str(caught.exception),
+                         "roles.py may run git; release /store/held's store lock before resolving the mode")
+
+    def test_a_roles_failure_refuses_the_brief_and_writes_nothing(self):
+        self.coordinator()
+        config = Path(os.environ["XDG_CONFIG_HOME"]) / "pstack-t3" / "roles.json"
+        config.parent.mkdir(parents=True)
+        config.write_text("{")
+        before = (self.at / "log.tsv").read_bytes()
+        error = self.brigade(*self.BRIEF, ok=False)
+        self.assertTrue(error.startswith(f"brigade: roles.py mode refused the brief: {config}: invalid JSON"), error)
+        self.assertFalse((self.at / "briefs/D1.md").exists())
+        self.assertEqual((self.at / "log.tsv").read_bytes(), before)
+
+    def paused_brief(self, case):
+        case.mkdir()
+        return self._spawn_race("brief-pause", case, ["--store", str(self.store), "--at", str(self.at),
+                                                      *_owner_words(self.at), *self.BRIEF])
+
+    def test_two_briefs_racing_append_one_mode_row(self):
+        self.coordinator()
+        self.record("a1", "send-back")
+        self.brigade("dish", "D1", "--state", "in-progress")
+        self.record("a2", "send-back")
+        case = Path(self.temporary.name) / "race"
+        first = self.paused_brief(case)
+        _wait_for_path(case / "paused", timeout=20)
+        second = self.brigade(*self.BRIEF)
+        (case / "proceed").touch()
+        code, out, err = self._finish_race(first)
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(out, second)
+        self.assertEqual(len(self.mode_rows()), 1)
+
+    def test_a_mode_set_while_roles_runs_is_in_the_brief(self):
+        self.coordinator()
+        case = Path(self.temporary.name) / "race"
+        first = self.paused_brief(case)
+        _wait_for_path(case / "paused", timeout=20)
+        self.brigade("set", "--mode", "full")
+        (case / "proceed").touch()
+        code, out, err = self._finish_race(first)
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn("Mode: full\nMode source: restaurant.json\n", out)
+
+    def test_a_store_that_keeps_changing_refuses_the_brief_after_three_resolutions(self):
+        self.coordinator()
+        case = Path(self.temporary.name) / "race"
+        case.mkdir()
+        churning = self._spawn_race("brief-churn", case, ["--store", str(self.store), "--at", str(self.at),
+                                                           *_owner_words(self.at), *self.BRIEF])
+        self.assertEqual(self._finish_race(churning), (1, "", "brigade: D1 changed while resolving its mode; run brief again"))
+        self.assertFalse((self.at / "briefs/D1.md").exists())
 
 
 class StoresTest(unittest.TestCase):
@@ -3175,6 +3854,25 @@ class AdminTest(StoresTest):
         self.assertEqual((land("lease", "list"), land("status")), before)
 
 
+class SeatLaunchDocTest(unittest.TestCase):
+    def setUp(self):
+        self.skill = (ROOT / "skills/brigade/SKILL.md").read_text()
+        service = self.skill.split("## Run a service", 1)[1].split("\n## ", 1)[0]
+        self.launch = next(line for line in service.splitlines() if line.startswith("   3. Launch the worker"))
+        self.review = next(line for line in service.splitlines() if line.startswith("6. **Review.**"))
+
+    def test_step_4_3_links_both_runtime_anchors_and_records_after_the_match(self):
+        self.assertIn("../pstack-runtime/SKILL.md#top-level-threads", self.launch)
+        self.assertIn("../pstack-runtime/SKILL.md#delegation", self.launch)
+        self.assertIn("Step 4.4 records the thread only after the readback matches.", self.launch)
+
+    def test_step_6_reads_configuration_before_the_verdict(self):
+        self.assertIn(
+            "Right after the spawn, confirm its options with `t3_thread_configuration` on the returned `childThreadId` before the verdict counts",
+            self.review,
+        )
+
+
 class LivenessIdleDocTest(unittest.TestCase):
     def test_step_5_nudges_an_idle_worker_with_its_timebox_open(self):
         text = (ROOT / "t3/added/brigade/SKILL.md").read_text()
@@ -3183,6 +3881,27 @@ class LivenessIdleDocTest(unittest.TestCase):
         self.assertIn("activeRunId", step)
         self.assertIn("nudge-<dish>-<that run id>", step)
         self.assertIn("goes to step 4", step)
+
+    def test_a_held_item_skips_liveness_steps_2_to_5(self):
+        text = (ROOT / "t3/added/brigade/SKILL.md").read_text()
+        section = text.split("## Liveness check", 1)[1].split("\n## ", 1)[0]
+        self.assertIn(
+            "`D1: open decision Q1: <question>; launch no worker or verifier until 86 answer Q1`",
+            section,
+        )
+        self.assertIn("Launch nothing and spawn nothing.", section)
+        self.assertIn("Skip Liveness steps 2 to 5 for that item.", section)
+        self.assertIn("Step 4.4 records that thread", section)
+        self.assertNotIn("Step 4.3 records that thread", section)
+        self.assertNotIn("Skip this line while `$B 86 list` parks that dish.", section)
+
+
+class AnswerRelayDocTest(unittest.TestCase):
+    def test_the_requests_answer_row_names_still_open(self):
+        text = (ROOT / "t3/added/brigade/SKILL.md").read_text()
+        requests = text.split("**Requests.**", 1)[1].split("\n**", 1)[0]
+        row = next(line for line in requests.splitlines() if line.startswith("| `answer "))
+        self.assertIn("still open", row)
 
 
 if __name__ == "__main__":
