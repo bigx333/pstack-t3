@@ -55,6 +55,7 @@ PROMPT_CAPS = {"claude-haiku-5-5": 100000}  # soft target: the estimated prompt 
 BYTES_PER_TOKEN = 4                          # rough, for prose and code
 OVERHEAD_TOKENS = 41000                      # harness allowance: a real T3 Claude Haiku 5.5 child's first request was 40,427 tokens on 2026-10-07
 BOUNDED_ROLES = frozenset({"skill tests"})
+CANNOT_LAUNCH_SEATS = frozenset({"cursor"})   # its harness sends target.options as a JSON string, which T3 refuses
 SKILL_TESTS_CAP_NOTE = "claude-haiku-5-5 is capped; roles.py bounded-seat launches it when the whole prompt fits"
 CATALOG_REQUIRED = "catalog-required"
 DEFAULT_PANEL = "default-panel"
@@ -529,7 +530,7 @@ def default_effort_rank(model):
     return rank(default["id"])
 
 
-def skill_tests_seat(catalog, allow_capped=False):
+def skill_tests_seat(catalog, allow_capped=False, providers=None):
     """One bare seat. Prefer another family, then a small-tier id, then a lower default effort.
 
     The winning row names a model line. The seat is the newest version of that line.
@@ -538,6 +539,8 @@ def skill_tests_seat(catalog, allow_capped=False):
     parent_family = family(parent) if parent else None
     rows = []
     for provider_index, provider in enumerate(catalog["providers"]):
+        if providers is not None and provider["providerInstanceId"] not in providers:
+            continue
         if not runnable(provider):
             continue
         for model_index, model in enumerate(models_of(provider)):
@@ -1070,6 +1073,22 @@ def launch_model(seat, parent):
     return seat["model"]
 
 
+def launch_providers(config, catalog):
+    configured = {
+        seat["providerInstanceId"]
+        for name in SINGLE_ROLES
+        for seat in config["roles"].get(name) or []
+        if isinstance(seat, dict)
+    } - CANNOT_LAUNCH_SEATS
+    return configured or {provider["providerInstanceId"] for provider in catalog["providers"]} - CANNOT_LAUNCH_SEATS
+
+
+def launch_provider(seat, parent):
+    if seat == INHERIT:
+        return parent.provider
+    return seat["providerInstanceId"]
+
+
 def emit_bounded(seat, capped, estimate, reason, notes):
     print(json.dumps({
         "seat": seat,
@@ -1092,12 +1111,25 @@ def command_bounded_seat(args):
     check_reads(reads)
     decision = effective_mode(config, args.brief_mode, args.session_mode, args.coordinator_mode)
     budget = seat_budget(config["budget"], decision.mode)
+    launches_seats = args.launches_seats
+    providers = launch_providers(config, catalog) if launches_seats else None
     configured = (config.get("roles") or {}).get("skill tests")
-    candidate = configured[0] if configured else skill_tests_seat(catalog, allow_capped=True)
+    configured_cursor = (
+        launches_seats
+        and configured
+        and isinstance(configured[0], dict)
+        and configured[0]["providerInstanceId"] in CANNOT_LAUNCH_SEATS
+    )
+    if configured and not configured_cursor:
+        candidate = configured[0]
+    else:
+        candidate = skill_tests_seat(catalog, allow_capped=True, providers=providers)
 
     def resolved(seat):
         value, raw_notes, _problems = resolve_seat(seat, catalog, budget, "skill tests")
         notes = [note["info"] if isinstance(note, dict) else note for note in raw_notes]
+        if launches_seats and launch_provider(value, parent) in CANNOT_LAUNCH_SEATS:
+            raise RolesError("role 'skill tests' has no non-cursor seat for a child that launches seats")
         return value, notes
 
     seat, notes = resolved(candidate)
@@ -1114,7 +1146,7 @@ def command_bounded_seat(args):
         f"estimate {estimate['tokens']} tokens is over the {estimate['target']}-token target "
         f"for {bare_id(model)}"
     )
-    fallback, more = resolved(skill_tests_seat(catalog, allow_capped=False))
+    fallback, more = resolved(skill_tests_seat(catalog, allow_capped=False, providers=providers))
     if prompt_cap(launch_model(fallback, parent)) is not None:
         raise RolesError(
             "role 'skill tests' has no uncapped seat for this test: "
@@ -1518,6 +1550,8 @@ def main(argv=None):
     bounded.add_argument("--parent", required=True, help="this thread's provider/model from orchestrator_capabilities (inheritedProviderInstanceId/inheritedModel)")
     bounded.add_argument("--brief", required=True, help="brief file whose bytes are counted toward the cap")
     bounded.add_argument("--read", action="append", help="file counted toward the estimate")
+    bounded.add_argument("--launches-seats", action="store_true",
+                         help="rank the user's single-role providers, or every provider but cursor")
     mode = sub.add_parser("mode")
     mode.add_argument("--cwd", default=os.getcwd())
     mode.add_argument("--config", help="user roles file (default ~/.config/pstack-t3/roles.json)")
